@@ -1,0 +1,17 @@
+[Unit]
+Description=TradingBot v2 - NSE Index Signal Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/TradingBot
+ExecStart=/root/TradingBot/venv/bin/python main.py
+Restart=always
+RestartSec=30
+StandardOutput=append:/var/log/tradingbot.log
+StandardError=append:/var/log/tradingbot.log
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
