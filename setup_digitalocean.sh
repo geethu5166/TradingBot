@@ -1,48 +1,84 @@
 #!/bin/bash
-# TradingBot v2 — DigitalOcean Ubuntu 22.04 Setup Script
+# TradingBot v2.1 - DigitalOcean Ubuntu 22.04 One-Command Setup
 # Run as root: bash setup_digitalocean.sh
 set -e
 
-echo '=== [1/7] System update ==='
-apt-get update && apt-get upgrade -y
-apt-get install -y python3 python3-pip python3-venv git tzdata
+echo ""
+echo "======================================="
+echo "  TradingBot v2.1 - DigitalOcean Setup"
+echo "======================================="
+echo ""
 
-echo '=== [2/7] Set timezone to IST ==='
+echo "[1/8] Stopping & removing any old bot..."
+systemctl stop tradingbot 2>/dev/null || true
+systemctl disable tradingbot 2>/dev/null || true
+rm -f /etc/systemd/system/tradingbot.service
+rm -rf /root/TradingBot
+systemctl daemon-reload
+echo "     Done."
+
+echo "[2/8] System update..."
+apt-get update -y && apt-get upgrade -y
+apt-get install -y python3 python3-pip python3-venv git tzdata curl
+echo "     Done."
+
+echo "[3/8] Setting timezone to IST..."
 timedatectl set-timezone Asia/Kolkata
+echo "     Timezone: $(timedatectl | grep 'Time zone')"
 
-echo '=== [3/7] Clone / update repo ==='
-if [ -d "/root/TradingBot" ]; then
-    cd /root/TradingBot && git pull
-else
-    git clone https://github.com/geethu5166/TradingBot.git /root/TradingBot
-fi
+echo "[4/8] Cloning repo from GitHub..."
+git clone https://github.com/geethu5166/TradingBot.git /root/TradingBot
+echo "     Done."
 
-echo '=== [4/7] Python venv and dependencies ==='
+echo "[5/8] Creating Python venv & installing packages..."
 cd /root/TradingBot
 python3 -m venv venv
-venv/bin/pip install --upgrade pip
-venv/bin/pip install -r requirements.txt
+venv/bin/pip install --upgrade pip --quiet
+venv/bin/pip install -r requirements.txt --quiet
+echo "     Done."
 
-echo '=== [5/7] Setup .env ==='
+echo "[6/8] Setting up .env file..."
 if [ ! -f "/root/TradingBot/.env" ]; then
     cp /root/TradingBot/.env.example /root/TradingBot/.env
-    echo ''
-    echo '>>> IMPORTANT: Edit /root/TradingBot/.env with your API keys! <<<'
-    echo '>>> Run: nano /root/TradingBot/.env'
-    echo ''
+    echo ""
+    echo "  ╔══════════════════════════════════════════╗"
+    echo "  ║  IMPORTANT: Add your API keys to .env!  ║"
+    echo "  ╚══════════════════════════════════════════╝"
+    echo ""
+    echo "  Run this command to edit:"
+    echo "  nano /root/TradingBot/.env"
+    echo ""
+    echo "  Add these 3 values:"
+    echo "  GEMINI_API_KEY=your_gemini_key"
+    echo "  TELEGRAM_BOT_TOKEN=your_bot_token"
+    echo "  TELEGRAM_CHAT_ID=your_chat_id"
+    echo ""
+else
+    echo "     .env already exists, skipping."
 fi
 
-echo '=== [6/7] Install systemd service ==='
+echo "[7/8] Installing systemd service..."
 cp /root/TradingBot/tradingbot.service /etc/systemd/system/tradingbot.service
 systemctl daemon-reload
 systemctl enable tradingbot
-systemctl start tradingbot
+echo "     Service enabled."
 
-echo '=== [7/7] Done! ==='
-echo ''
-echo 'Useful commands:'
-echo '  View live logs:    journalctl -u tradingbot -f'
-echo '  View bot.log:      tail -f /root/TradingBot/bot.log'
-echo '  Stop bot:          systemctl stop tradingbot'
-echo '  Restart bot:       systemctl restart tradingbot'
-echo '  Check status:      systemctl status tradingbot'
+echo "[8/8] Setup complete!"
+echo ""
+echo "  ┌─────────────────────────────────────────────┐"
+echo "  │  NEXT STEPS:                                │"
+echo "  │                                             │"
+echo "  │  1. Add your API keys:                      │"
+echo "  │     nano /root/TradingBot/.env              │"
+echo "  │                                             │"
+echo "  │  2. Start the bot:                          │"
+echo "  │     systemctl start tradingbot              │"
+echo "  │                                             │"
+echo "  │  3. Watch live logs:                        │"
+echo "  │     journalctl -u tradingbot -f             │"
+echo "  │                                             │"
+echo "  │  Telegram commands: /start /status          │"
+echo "  │                     /signals /symbols       │"
+echo "  │                     /market /stop           │"
+echo "  └─────────────────────────────────────────────┘"
+echo ""
