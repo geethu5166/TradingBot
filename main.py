@@ -1,10 +1,26 @@
+"""
+Advanced Indian Market Trading Bot v2.0
+- Gemini 1.5 Flash multi-agent signal engine
+- NSE Indices + Top F&O stocks
+- Telegram alerts to YOUR private chat only (locked to your chat_id)
+- Market hours aware (NSE 9:15 AM - 3:30 PM IST, Mon-Fri)
+- Per-symbol cooldown (no duplicate spam)
+- Daily summary alert at 3:35 PM IST
+- Structured logging to console + bot.log
+- DigitalOcean / Docker ready
+"""
+
 import os
-import time
+import re
 import json
+import time
 import logging
 import requests
 import traceback
-from datetime import datetime, timedelta
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
+from typing import Optional
+
 import pandas as pd
 import yfinance as yf
 import google.generativeai as genai
@@ -12,250 +28,345 @@ from dotenv import load_dotenv
 from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.trend import MACD, ADXIndicator, SMAIndicator, EMAIndicator, CCIIndicator
 from ta.volatility import AverageTrueRange, BollingerBands
-from ta.volume import OnBalanceVolumeIndicator
 
-# ─── LOGGING ───────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# BOOTSTRAP
+# ──────────────────────────────────────────────────────────
+load_dotenv()
+
+IST = ZoneInfo("Asia/Kolkata")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+        logging.StreamHandler(),
+        logging.FileHandler("bot.log", encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("TradingBot")
 
-# ─── ENV ────────────────────────────────────────────────────────────────────
-load_dotenv()
-GEMINI_API_KEY    = os.getenv("GEMINI_API_KEY")
-BOT_TOKEN         = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID           = os.getenv("TELEGRAM_CHAT_ID")
-INTERVAL          = os.getenv("INTERVAL", "15m")
-SLEEP_SECONDS     = int(os.getenv("SLEEP_SECONDS", "900"))
-CONFIDENCE_THRESH = int(os.getenv("CONFIDENCE_THRESHOLD", "70"))
+# ──────────────────────────────────────────────────────────
+# CONFIG
+# ──────────────────────────────────────────────────────────
+GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")   # your personal chat ID - locked
 
-genai.configure(api_key=GEMINI_API_KEY)
+INTERVAL        = "15m"
+SCAN_PERIOD     = "5d"
+LOOP_SLEEP_SEC  = 900          # 15 minutes
+MIN_CONFIDENCE  = 72           # alert only if AI confidence >= this
+COOLDOWN_MIN    = 60           # don't re-alert same symbol within N minutes
+MARKET_OPEN     = dt_time(9, 15)
+MARKET_CLOSE    = dt_time(15, 30)
+SUMMARY_TIME    = dt_time(15, 35)
 
-# ─── SYMBOLS ────────────────────────────────────────────────────────────────
-SYMBOLS = {
-    "NIFTY 50":   "^NSEI",
-    "BANK NIFTY": "^NSEBANK",
-    "MIDCAP 50":  "^NSEMDCP50",
-    "SENSEX":     "^BSESN",
-    "FINNIFTY":   "^CNXFIN",
+SYMBOLS: dict[str, str] = {
+    # Indices
+    "NIFTY 50":     "^NSEI",
+    "BANK NIFTY":   "^NSEBANK",
+    "MIDCAP 50":    "^NSEMDCP50",
+    # Top F&O Stocks
+    "RELIANCE":     "RELIANCE.NS",
+    "TCS":          "TCS.NS",
+    "INFOSYS":      "INFY.NS",
+    "HDFC BANK":    "HDFCBANK.NS",
+    "ICICI BANK":   "ICICIBANK.NS",
+    "WIPRO":        "WIPRO.NS",
+    "ADANIENT":     "ADANIENT.NS",
+    "TATAMOTORS":   "TATAMOTORS.NS",
+    "BAJFINANCE":   "BAJFINANCE.NS",
+    "AXISBANK":     "AXISBANK.NS",
 }
 
-# ─── MARKET HOURS CHECK ─────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────
+# STATE
+# ──────────────────────────────────────────────────────────
+last_alert_time: dict[str, float] = {}
+daily_signals:   list[dict]       = []
+summary_sent_today: bool          = False
+
+# ──────────────────────────────────────────────────────────
+# MARKET HOURS
+# ──────────────────────────────────────────────────────────
 def is_market_open() -> bool:
-    """Returns True if NSE is currently open (Mon–Fri 09:15–15:30 IST)."""
-    from zoneinfo import ZoneInfo
-    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
-    open_time  = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
-    return open_time <= now <= close_time
+    t = now.time()
+    return MARKET_OPEN <= t <= MARKET_CLOSE
 
-# ─── INDICATORS ─────────────────────────────────────────────────────────────
-def compute_indicators(df: pd.DataFrame) -> dict:
-    """Returns a dict of the latest indicator values."""
-    close = df["Close"]
-    high  = df["High"]
-    low   = df["Low"]
-    vol   = df["Volume"]
+def is_summary_time() -> bool:
+    now = datetime.now(IST)
+    t   = now.time()
+    return SUMMARY_TIME <= t <= dt_time(15, 40) and now.weekday() < 5
 
-    adx  = ADXIndicator(high, low, close)
-    macd = MACD(close)
-    bb   = BollingerBands(close)
-    sto  = StochasticOscillator(high, low, close)
-    obv  = OnBalanceVolumeIndicator(close, vol)
-
-    df["rsi"]      = RSIIndicator(close).rsi()
-    df["adx"]      = adx.adx()
-    df["adx_pos"]  = adx.adx_pos()
-    df["adx_neg"]  = adx.adx_neg()
-    df["macd"]     = macd.macd()
-    df["macd_sig"] = macd.macd_signal()
-    df["macd_dif"] = macd.macd_diff()
-    df["atr"]      = AverageTrueRange(high, low, close).average_true_range()
-    df["sma50"]    = SMAIndicator(close, window=50).sma_indicator()
-    df["sma200"]   = SMAIndicator(close, window=200).sma_indicator()
-    df["ema20"]    = EMAIndicator(close, window=20).ema_indicator()
-    df["ema9"]     = EMAIndicator(close, window=9).ema_indicator()
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-    df["bb_pct"]   = bb.bollinger_pband()
-    df["stoch_k"]  = sto.stoch()
-    df["stoch_d"]  = sto.stoch_signal()
-    df["obv"]      = obv.on_balance_volume()
-    df["cci"]      = CCIIndicator(high, low, close).cci()
-
-    row = df.iloc[-1].to_dict()
-
-    row["trend_bull"]     = row["ema9"] > row["ema20"] > row["sma50"]
-    row["golden_cross"]   = row["sma50"] > row["sma200"]
-    row["macd_bull"]      = row["macd_dif"] > 0
-    row["rsi_oversold"]   = row["rsi"] < 35
-    row["rsi_overbought"] = row["rsi"] > 65
-
-    last3 = df["Close"].iloc[-3:]
-    row["momentum_up"]   = bool(all(last3.diff().dropna() > 0))
-    row["momentum_down"] = bool(all(last3.diff().dropna() < 0))
-
-    return row
-
-# ─── AI ANALYSIS ─────────────────────────────────────────────────────────────
-def ai_analysis(symbol: str, d: dict):
-    model = genai.GenerativeModel("gemini-1.5-flash")
-    prompt = f"""
-You are a senior quantitative analyst and CIO of a multi-strategy trading firm.
-Analyze the following real-time indicator snapshot for {symbol} and return a precise trade decision.
-
-=== SNAPSHOT ===
-Price:       {d["Close"]:.2f}
-ADX:         {d["adx"]:.2f}  (+DI {d["adx_pos"]:.2f} / -DI {d["adx_neg"]:.2f})
-RSI(14):     {d["rsi"]:.2f}
-MACD Diff:   {d["macd_dif"]:.4f}  (MACD {d["macd"]:.4f} / Signal {d["macd_sig"]:.4f})
-ATR:         {d["atr"]:.2f}
-EMA9:        {d["ema9"]:.2f} | EMA20: {d["ema20"]:.2f}
-SMA50:       {d["sma50"]:.2f} | SMA200: {d["sma200"]:.2f}
-BB %B:       {d["bb_pct"]:.2f}  (Upper {d["bb_upper"]:.2f} / Lower {d["bb_lower"]:.2f})
-Stoch K/D:   {d["stoch_k"]:.2f} / {d["stoch_d"]:.2f}
-CCI:         {d["cci"]:.2f}
-OBV Trend:   Rising={d["obv"] > 0}
-Trend Flags: Bullish EMA Stack={d["trend_bull"]} | Golden Cross={d["golden_cross"]}
-             MACD Bullish={d["macd_bull"]} | RSI Oversold={d["rsi_oversold"]} | RSI Overbought={d["rsi_overbought"]}
-             3-Candle Momentum Up={d["momentum_up"]} | Down={d["momentum_down"]}
-
-=== TASKS ===
-1. Trend Squad:    Evaluate EMA stack, ADX strength (>25=strong), SMA crossovers.
-2. Momentum Squad: Confirm MACD, RSI, Stoch, CCI alignment.
-3. Volatility Squad: Use ATR to set dynamic Stop Loss (1.5x ATR from entry). Assess BB squeeze vs expansion.
-4. Volume Squad:  Confirm OBV trend matches price direction.
-5. Risk Squad:    Calculate R:R ratio. Reject if < 1.5.
-
-=== OUTPUT ===
-Return ONLY a valid JSON object (no markdown, no explanation):
-{{
-  "signal": "BUY" or "SELL" or "HOLD",
-  "confidence": integer 0-100,
-  "entry": float,
-  "sl": float,
-  "tp1": float,
-  "tp2": float,
-  "rr_ratio": float,
-  "regime": "TRENDING" or "RANGING" or "VOLATILE",
-  "timeframe": "Intraday" or "Swing",
-  "rationale": "two sentence explanation"
-}}
-"""
+# ──────────────────────────────────────────────────────────
+# INDICATORS
+# ──────────────────────────────────────────────────────────
+def compute_indicators(df: pd.DataFrame) -> Optional[pd.Series]:
+    if len(df) < 50:
+        return None
     try:
-        resp = model.generate_content(prompt)
-        raw  = resp.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(raw)
+        close = df["Close"].squeeze()
+        high  = df["High"].squeeze()
+        low   = df["Low"].squeeze()
+
+        df["ema9"]    = EMAIndicator(close, window=9).ema_indicator()
+        df["ema21"]   = EMAIndicator(close, window=21).ema_indicator()
+        df["sma50"]   = SMAIndicator(close, window=50).sma_indicator()
+        df["sma200"]  = SMAIndicator(close, window=200).sma_indicator()
+
+        df["rsi"]     = RSIIndicator(close).rsi()
+        macd_obj      = MACD(close)
+        df["macd"]    = macd_obj.macd()
+        df["macd_sig"]= macd_obj.macd_signal()
+        df["macd_dif"]= macd_obj.macd_diff()
+        stoch         = StochasticOscillator(high, low, close)
+        df["stoch_k"] = stoch.stoch()
+        df["stoch_d"] = stoch.stoch_signal()
+        df["cci"]     = CCIIndicator(high, low, close).cci()
+
+        df["atr"]     = AverageTrueRange(high, low, close).average_true_range()
+        bb            = BollingerBands(close)
+        df["bb_upper"]= bb.bollinger_hband()
+        df["bb_lower"]= bb.bollinger_lband()
+        df["bb_width"]= bb.bollinger_wband()
+
+        adx           = ADXIndicator(high, low, close)
+        df["adx"]     = adx.adx()
+        df["adx_pos"] = adx.adx_pos()
+        df["adx_neg"] = adx.adx_neg()
+
+        df["vol_avg20"] = df["Volume"].rolling(20).mean()
+        df["vol_ratio"] = df["Volume"] / df["vol_avg20"]
+
+        row = df.iloc[-1].copy()
+        row["prev_close"] = float(df["Close"].iloc[-2])
+        return row
     except Exception as e:
-        log.warning(f"AI parse error for {symbol}: {e}")
+        log.error(f"Indicator error: {e}")
         return None
 
-# ─── TELEGRAM ────────────────────────────────────────────────────────────────
-def send_telegram(text: str, parse_mode: str = "Markdown") -> bool:
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+# ──────────────────────────────────────────────────────────
+# GEMINI AI
+# ──────────────────────────────────────────────────────────
+def ai_analysis(symbol: str, d: pd.Series) -> Optional[dict]:
     try:
-        r = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": parse_mode}, timeout=10)
-        return r.status_code == 200
+        model  = genai.GenerativeModel("gemini-1.5-flash")
+        change = ((float(d["Close"]) - float(d["prev_close"])) / float(d["prev_close"])) * 100
+
+        prompt = f"""
+You are the Chief Investment Officer of a quantitative hedge fund running 1,000 specialised AI agents
+on the NSE Indian market. Your agents have completed their analysis and report the following data.
+
+INSTRUMENT : {symbol}
+PRICE      : Rs.{float(d['Close']):.2f}  ({change:+.2f}% vs prev close)
+TIMEFRAME  : 15-minute candles
+
+--- TREND SQUAD ---
+EMA9={float(d['ema9']):.2f}  EMA21={float(d['ema21']):.2f}
+SMA50={float(d['sma50']):.2f}  SMA200={float(d['sma200']):.2f}
+ADX={float(d['adx']):.1f} (+DI={float(d['adx_pos']):.1f} / -DI={float(d['adx_neg']):.1f})
+
+--- MOMENTUM SQUAD ---
+RSI={float(d['rsi']):.1f}  CCI={float(d['cci']):.1f}
+MACD Hist={float(d['macd_dif']):.4f}  Signal={float(d['macd_sig']):.4f}
+Stoch %K={float(d['stoch_k']):.1f}  %D={float(d['stoch_d']):.1f}
+
+--- VOLATILITY SQUAD ---
+ATR={float(d['atr']):.2f}
+BB Upper={float(d['bb_upper']):.2f}  Lower={float(d['bb_lower']):.2f}  Width={float(d['bb_width']):.2f}
+
+--- VOLUME SQUAD ---
+Volume Ratio vs 20-day avg = {float(d['vol_ratio']):.2f}x
+
+INSTRUCTIONS:
+1. Synthesise ALL agent reports above into a single trade decision.
+2. Entry must be based on current price plus or minus 0.1%.
+3. Stop-Loss must be exactly 1.5x ATR from entry.
+4. Target must give at least 2:1 reward-to-risk.
+5. Confidence must reflect CONFLUENCE of signals (multiple agreeing = higher).
+6. If trend is weak (ADX < 20) or signals conflict badly, set signal to HOLD.
+
+Return ONLY a valid JSON object. No markdown, no extra text:
+{{
+  "signal":     "BUY",
+  "confidence": 85,
+  "entry":      1234.56,
+  "sl":         1210.00,
+  "tp":         1284.00,
+  "rationale":  "One concise sentence."
+}}
+"""
+        response = model.generate_content(prompt)
+        raw = response.text.strip()
+        raw = re.sub(r"```(?:json)?", "", raw).replace("```", "").strip()
+        return json.loads(raw)
+
+    except json.JSONDecodeError as e:
+        log.warning(f"[{symbol}] JSON parse failed: {e}")
+    except Exception as e:
+        log.error(f"[{symbol}] Gemini error: {e}")
+    return None
+
+# ──────────────────────────────────────────────────────────
+# TELEGRAM — locked to YOUR chat_id only
+# ──────────────────────────────────────────────────────────
+def _tg_post(text: str) -> bool:
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram credentials missing.")
+        return False
+    url     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":    TELEGRAM_CHAT_ID,
+        "text":       text,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True,
+    }
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        r.raise_for_status()
+        return True
     except Exception as e:
         log.error(f"Telegram error: {e}")
         return False
 
-def format_alert(name: str, price: float, sig: dict) -> str:
-    emoji  = "\U0001f680" if sig["signal"] == "BUY" else "\U0001f53b" if sig["signal"] == "SELL" else "\u23f8"
-    regime = {"TRENDING": "\U0001f4c8 Trending", "RANGING": "\u2194\ufe0f Ranging", "VOLATILE": "\u26a1 Volatile"}.get(sig.get("regime",""), "")
-    ts     = datetime.now().strftime("%d %b %Y  %H:%M IST")
-    return (
-        f"{emoji} *{sig['signal']} SIGNAL \u2014 {name}*\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f550 *Time:*       {ts}\n"
-        f"\U0001f4b0 *Price:*      `{price:.2f}`\n"
-        f"\U0001f4cd *Entry:*      `{sig['entry']:.2f}`\n"
-        f"\U0001f6d1 *Stop Loss:*  `{sig['sl']:.2f}`\n"
-        f"\U0001f3af *Target 1:*   `{sig['tp1']:.2f}`\n"
-        f"\U0001f3af *Target 2:*   `{sig['tp2']:.2f}`\n"
-        f"\u2696\ufe0f *R:R Ratio:*  `{sig.get('rr_ratio',0):.2f}`\n"
-        f"\U0001f4ca *Confidence:* `{sig['confidence']}%`\n"
-        f"\U0001f310 *Regime:*     {regime}\n"
-        f"\u23f1 *Timeframe:*  {sig.get('timeframe','Intraday')}\n"
-        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f4dd {sig['rationale']}\n"
+def send_signal_alert(symbol: str, sig: dict):
+    emoji = "\U0001f680" if sig["signal"] == "BUY" else "\U0001f53b"
+    rr    = abs(sig["tp"] - sig["entry"]) / max(abs(sig["sl"] - sig["entry"]), 0.01)
+    text  = (
+        f"{emoji} *{sig['signal']} SIGNAL \u2014 {symbol}*\n"
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
+        f"\U0001f4cd *Entry :* `Rs.{sig['entry']:.2f}`\n"
+        f"\U0001f6d1 *Stop Loss :* `Rs.{sig['sl']:.2f}`\n"
+        f"\U0001f3af *Target :* `Rs.{sig['tp']:.2f}`\n"
+        f"\u2696\ufe0f *R:R :* `1 : {rr:.1f}`\n"
+        f"\U0001f4ca *Confidence :* `{sig['confidence']}%`\n"
+        f"\U0001f4dd *Rationale :* {sig['rationale']}\n"
+        f"\U0001f550 *Time :* {datetime.now(IST).strftime('%d %b %Y  %H:%M IST')}\n"
         f"\u26a0\ufe0f _Not financial advice. Trade responsibly._"
     )
+    if _tg_post(text):
+        log.info(f"[{symbol}] Alert sent \u2192 {sig['signal']} @ Rs.{sig['entry']:.2f}")
 
-# ─── HEALTH PING ─────────────────────────────────────────────────────────────
-last_health_ping = datetime.min
+def send_daily_summary():
+    if not daily_signals:
+        _tg_post("\U0001f4cb *Daily Summary* \u2014 No actionable signals today.")
+        return
+    buys  = [s for s in daily_signals if s["signal"] == "BUY"]
+    sells = [s for s in daily_signals if s["signal"] == "SELL"]
+    lines = [
+        f"\U0001f4cb *Daily Summary \u2014 {datetime.now(IST).strftime('%d %b %Y')}*",
+        f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+        f"Total Signals : {len(daily_signals)}   \U0001f680 BUY: {len(buys)}   \U0001f53b SELL: {len(sells)}",
+        "",
+    ]
+    for s in daily_signals:
+        e = "\U0001f680" if s["signal"] == "BUY" else "\U0001f53b"
+        lines.append(f"{e} {s['symbol']} | Entry Rs.{s['entry']:.2f} | Conf {s['confidence']}%")
+    _tg_post("\n".join(lines))
+    log.info("Daily summary sent.")
 
-def health_ping():
-    global last_health_ping
-    now = datetime.now()
-    if (now - last_health_ping) >= timedelta(hours=6):
-        send_telegram("\U0001f916 *TradingBot Heartbeat* \u2014 Running normally \u2705")
-        last_health_ping = now
+# ──────────────────────────────────────────────────────────
+# COOLDOWN
+# ──────────────────────────────────────────────────────────
+def is_on_cooldown(symbol: str) -> bool:
+    last = last_alert_time.get(symbol, 0)
+    return (time.time() - last) < (COOLDOWN_MIN * 60)
 
-# ─── MAIN LOOP ────────────────────────────────────────────────────────────────
-def run():
-    log.info("TradingBot v2 started.")
-    send_telegram("\U0001f916 *TradingBot v2 Started* \u2014 Monitoring NSE indices \U0001f4e1")
+# ──────────────────────────────────────────────────────────
+# SCAN ONE SYMBOL
+# ──────────────────────────────────────────────────────────
+def scan_symbol(name: str, ticker: str):
+    try:
+        df = yf.download(ticker, period=SCAN_PERIOD, interval=INTERVAL,
+                         progress=False, auto_adjust=True)
+        if df.empty or len(df) < 50:
+            log.warning(f"[{name}] Insufficient data ({len(df)} rows)")
+            return
+
+        data = compute_indicators(df)
+        if data is None:
+            return
+
+        sig = ai_analysis(name, data)
+        if sig is None:
+            return
+
+        log.info(f"[{name}] {sig['signal']} | Conf={sig['confidence']}%")
+
+        if sig["signal"] == "HOLD":
+            return
+        if sig["confidence"] < MIN_CONFIDENCE:
+            log.info(f"[{name}] Skipped \u2014 confidence {sig['confidence']}% below {MIN_CONFIDENCE}%")
+            return
+        if is_on_cooldown(name):
+            log.info(f"[{name}] Skipped \u2014 cooldown active")
+            return
+
+        send_signal_alert(name, sig)
+        last_alert_time[name] = time.time()
+        sig["symbol"] = name
+        daily_signals.append(sig)
+
+    except Exception:
+        log.error(f"[{name}] Unhandled exception:\n{traceback.format_exc()}")
+
+# ──────────────────────────────────────────────────────────
+# MAIN LOOP
+# ──────────────────────────────────────────────────────────
+def main():
+    global summary_sent_today, daily_signals
+
+    if not GEMINI_API_KEY:
+        log.critical("GEMINI_API_KEY not set in .env \u2014 exiting.")
+        raise SystemExit(1)
+
+    genai.configure(api_key=GEMINI_API_KEY)
+
+    log.info("=" * 55)
+    log.info("  TradingBot v2.0 \u2014 started")
+    log.info(f"  Symbols     : {len(SYMBOLS)}")
+    log.info(f"  Scan every  : {LOOP_SLEEP_SEC // 60} minutes")
+    log.info(f"  Min Conf    : {MIN_CONFIDENCE}%  |  Cooldown: {COOLDOWN_MIN} min")
+    log.info("=" * 55)
+
+    _tg_post(
+        f"\u2705 *TradingBot v2.0 Online*\n"
+        f"Scanning *{len(SYMBOLS)} instruments* every {LOOP_SLEEP_SEC // 60} min\n"
+        f"Market hours: 09:15 \u2013 15:30 IST (Mon\u2013Fri)\n"
+        f"Min confidence threshold: {MIN_CONFIDENCE}%"
+    )
 
     while True:
-        try:
-            health_ping()
+        now_ist = datetime.now(IST)
 
-            if not is_market_open():
-                log.info("Market closed. Sleeping 15 min...")
-                time.sleep(900)
-                continue
+        # Reset daily state at midnight
+        if now_ist.hour == 0 and now_ist.minute < 15:
+            daily_signals      = []
+            summary_sent_today = False
 
-            cycle_start = datetime.now()
-            log.info(f"--- Scan cycle at {cycle_start.strftime('%H:%M:%S')} ---")
+        # Send end-of-day summary once
+        if is_summary_time() and not summary_sent_today:
+            send_daily_summary()
+            summary_sent_today = True
 
-            for name, ticker in SYMBOLS.items():
-                try:
-                    df = yf.download(ticker, period="10d", interval=INTERVAL, progress=False, auto_adjust=True)
-                    if df.empty or len(df) < 50:
-                        log.warning(f"{name}: insufficient data ({len(df)} rows)")
-                        continue
+        if not is_market_open():
+            log.info(f"Market closed ({now_ist.strftime('%H:%M IST')}) \u2014 sleeping {LOOP_SLEEP_SEC // 60} min")
+            time.sleep(LOOP_SLEEP_SEC)
+            continue
 
-                    indicators = compute_indicators(df)
-                    analysis   = ai_analysis(name, indicators)
+        log.info(f"\u2500\u2500 Scan cycle @ {now_ist.strftime('%H:%M IST')} \u2500\u2500")
+        for name, ticker in SYMBOLS.items():
+            scan_symbol(name, ticker)
+            time.sleep(2)    # gentle pacing between symbols
 
-                    if not analysis:
-                        log.info(f"{name}: AI returned no result")
-                        continue
+        log.info(f"\u2500\u2500 Cycle done. Sleeping {LOOP_SLEEP_SEC // 60} min \u2500\u2500")
+        time.sleep(LOOP_SLEEP_SEC)
 
-                    log.info(f"{name}: {analysis['signal']} conf={analysis['confidence']}% R:R={analysis.get('rr_ratio',0):.2f}")
-
-                    if (
-                        analysis["signal"] != "HOLD"
-                        and analysis["confidence"] >= CONFIDENCE_THRESH
-                        and analysis.get("rr_ratio", 0) >= 1.5
-                    ):
-                        alert = format_alert(name, indicators["Close"], analysis)
-                        ok = send_telegram(alert)
-                        log.info(f"Alert sent for {name}: {ok}")
-
-                except Exception as e:
-                    log.error(f"Error processing {name}: {e}\n{traceback.format_exc()}")
-
-            elapsed = (datetime.now() - cycle_start).total_seconds()
-            sleep_for = max(0, SLEEP_SECONDS - elapsed)
-            log.info(f"Cycle done in {elapsed:.1f}s. Next scan in {sleep_for:.0f}s.")
-            time.sleep(sleep_for)
-
-        except KeyboardInterrupt:
-            log.info("Bot stopped by user.")
-            send_telegram("\U0001f916 *TradingBot* \u2014 Stopped by user \U0001f6d1")
-            break
-        except Exception as e:
-            log.critical(f"Outer loop error: {e}\n{traceback.format_exc()}")
-            time.sleep(60)
 
 if __name__ == "__main__":
-    run()
+    main()
