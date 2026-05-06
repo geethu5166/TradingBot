@@ -1,5 +1,11 @@
 """
-TradingBot v3.3 — Full Professional Grade
+TradingBot v3.4 — Production Ready
+
+FIXES in v3.4:
+  - FIX 1: yfinance MultiIndex bug — flatten_df() applied in both
+            scan_symbol() and handle_signal_command() so /signal BTC works
+  - FIX 2: KOTAK_API_KEY default value removed (was hardcoded UUID)
+  - FIX 3: safe_json() guard on all Kotak API calls (no crash on empty/HTML response)
 
 FEATURES:
   /signal BTC            → Full AI deep analysis on demand
@@ -82,7 +88,7 @@ log = logging.getLogger("TradingBot")
 GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY", "")
 TELEGRAM_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
-KOTAK_API_KEY      = os.getenv("KOTAK_API_KEY", "662197a6-427e-4576-a7d1-222a48aedb95")
+KOTAK_API_KEY      = os.getenv("KOTAK_API_KEY", "")        # FIX 2: no hardcoded default
 KOTAK_ACCESS_TOKEN = os.getenv("KOTAK_ACCESS_TOKEN", "")
 KOTAK_USER_ID      = os.getenv("KOTAK_USER_ID", "")
 TWITTER_BEARER     = os.getenv("TWITTER_BEARER_TOKEN", "")
@@ -234,15 +240,58 @@ def is_summary_time() -> bool:
     return SUMMARY_TIME <= now.time() <= dt_time(15, 40) and now.weekday() < 5
 
 # ──────────────────────────────────────────────────────────
-# INDICATORS
+# FIX 1: yfinance v0.2+ MultiIndex flattener
+# ──────────────────────────────────────────────────────────
+def flatten_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    yfinance >= 0.2 wraps single-ticker downloads in a MultiIndex:
+        columns = [('Close','BTC-USD'), ('High','BTC-USD'), ...]
+    This collapses them back to simple names: Close, High, Low, Volume.
+    """
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [col[0] for col in df.columns]
+    df = df.loc[:, ~df.columns.duplicated()]
+    if "Volume" not in df.columns:
+        df["Volume"] = 0.0
+    return df
+
+
+def safe_download(ticker: str, period: str = SCAN_PERIOD,
+                  interval: str = INTERVAL) -> Optional[pd.DataFrame]:
+    """Download + flatten. Retries with daily interval if 15m has < 50 rows."""
+    for ivl in [interval, "1d"]:
+        try:
+            raw = yf.download(
+                ticker,
+                period=period if ivl == interval else "6mo",
+                interval=ivl,
+                progress=False,
+                auto_adjust=True,
+                threads=False,
+            )
+            if raw is None or raw.empty:
+                continue
+            df = flatten_df(raw.copy())
+            df.dropna(subset=["Close", "High", "Low"], inplace=True)
+            if len(df) >= 50:
+                return df
+        except Exception as e:
+            log.warning(f"[{ticker}] download error ({ivl}): {e}")
+    return None
+
+# ──────────────────────────────────────────────────────────
+# INDICATORS  (works on flat DataFrame only)
 # ──────────────────────────────────────────────────────────
 def compute_indicators(df: pd.DataFrame) -> Optional[pd.Series]:
     if len(df) < 50:
         return None
     try:
-        close = df["Close"].squeeze()
-        high  = df["High"].squeeze()
-        low   = df["Low"].squeeze()
+        close = df["Close"].astype(float)
+        high  = df["High"].astype(float)
+        low   = df["Low"].astype(float)
+        vol   = df["Volume"].astype(float)
+
+        df = df.copy()
         df["ema9"]     = EMAIndicator(close, window=9).ema_indicator()
         df["ema21"]    = EMAIndicator(close, window=21).ema_indicator()
         df["sma50"]    = SMAIndicator(close, window=50).sma_indicator()
@@ -265,14 +314,34 @@ def compute_indicators(df: pd.DataFrame) -> Optional[pd.Series]:
         df["adx"]      = adx.adx()
         df["adx_pos"]  = adx.adx_pos()
         df["adx_neg"]  = adx.adx_neg()
-        df["vol_avg20"]= df["Volume"].rolling(20).mean()
-        df["vol_ratio"]= df["Volume"] / df["vol_avg20"]
+        df["vol_avg20"]= vol.rolling(20).mean()
+        df["vol_ratio"]= vol / df["vol_avg20"].replace(0, 1)
+
         row = df.iloc[-1].copy()
         row["prev_close"] = float(df["Close"].iloc[-2])
         return row
     except Exception as e:
-        log.error(f"Indicator error: {e}")
+        log.error(f"Indicator error: {e}\n{traceback.format_exc()}")
         return None
+
+# ──────────────────────────────────────────────────────────
+# FIX 3: Safe JSON helper for Kotak API
+# ──────────────────────────────────────────────────────────
+def safe_json(resp: requests.Response) -> Optional[dict]:
+    """
+    KotakNeo returns HTML (login page) or empty body when token is
+    missing/expired. Returns None instead of crashing with JSONDecodeError.
+    """
+    try:
+        text = resp.text.strip()
+        if not text or text.startswith("<"):
+            return None
+        return resp.json()
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+def _kotak_token_missing() -> bool:
+    return not KOTAK_ACCESS_TOKEN or not KOTAK_ACCESS_TOKEN.strip()
 
 # ──────────────────────────────────────────────────────────
 # TWITTER — @REDBOXINDIA latest tweets
@@ -282,7 +351,6 @@ def get_redbox_news(max_tweets: int = 5) -> list[str]:
     if not TWITTER_BEARER:
         return []
     try:
-        # Resolve user id for @REDBOXINDIA
         r = requests.get(
             "https://api.twitter.com/2/users/by/username/REDBOXINDIA",
             headers={"Authorization": f"Bearer {TWITTER_BEARER}"},
@@ -291,7 +359,6 @@ def get_redbox_news(max_tweets: int = 5) -> list[str]:
         uid = r.json().get("data", {}).get("id", "")
         if not uid:
             return []
-        # Fetch latest tweets
         r2 = requests.get(
             f"https://api.twitter.com/2/users/{uid}/tweets",
             headers={"Authorization": f"Bearer {TWITTER_BEARER}"},
@@ -317,19 +384,25 @@ def kotak_headers() -> dict:
     }
 
 def kotak_get_holdings() -> str:
-    """GET holdings from KotakNeo — READ ONLY."""
+    if _kotak_token_missing():
+        return (
+            "\u274c *KotakNeo not connected*\n"
+            "Add `KOTAK_ACCESS_TOKEN` to your `.env` file.\n"
+            "Get it from: https://neo.kotaksecurities.com \u2192 API section."
+        )
     try:
         r = requests.get(
             f"{KOTAK_BASE}/Holdings/1.0/portfolio/v1/holdings",
-            headers=kotak_headers(),
-            timeout=10,
+            headers=kotak_headers(), timeout=10,
         )
-        data = r.json()
+        data = safe_json(r)
+        if data is None:
+            return "\u274c KotakNeo: Session expired. Update KOTAK_ACCESS_TOKEN in .env"
         holdings = data.get("data", {}).get("holdings", [])
         if not holdings:
             return "\U0001f4bc No holdings found."
         lines = ["\U0001f4bc *Your KotakNeo Holdings*",
-                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                 "\u2501" * 22]
         total_val = 0
         for h in holdings:
             sym   = h.get("tradingSymbol", h.get("symbol", "?"))
@@ -352,19 +425,20 @@ def kotak_get_holdings() -> str:
         return f"\u274c KotakNeo error: {e}\nCheck KOTAK_ACCESS_TOKEN in .env"
 
 def kotak_get_positions() -> str:
-    """GET open positions — READ ONLY."""
+    if _kotak_token_missing():
+        return "\u274c KotakNeo not connected. Set KOTAK_ACCESS_TOKEN in .env"
     try:
         r = requests.get(
             f"{KOTAK_BASE}/Orders/2.0/quick/user/positions",
-            headers=kotak_headers(),
-            timeout=10,
+            headers=kotak_headers(), timeout=10,
         )
-        data = r.json()
+        data = safe_json(r)
+        if data is None:
+            return "\u274c KotakNeo: Session expired. Update KOTAK_ACCESS_TOKEN in .env"
         positions = data.get("data", {}).get("net", [])
         if not positions:
             return "\U0001f4ca No open positions."
-        lines = ["\U0001f4ca *Open Positions*",
-                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+        lines = ["\U0001f4ca *Open Positions*", "\u2501" * 22]
         for p in positions:
             sym  = p.get("tradingSymbol", "?")
             qty  = p.get("netQty", 0)
@@ -380,20 +454,27 @@ def kotak_get_positions() -> str:
         return f"\u274c Positions error: {e}"
 
 def kotak_get_trades() -> str:
-    """GET today's trade book — READ ONLY."""
+    if _kotak_token_missing():
+        return (
+            "\u274c *KotakNeo not connected*\n"
+            "Add `KOTAK_ACCESS_TOKEN` to your `.env` to view trade history."
+        )
     try:
         r = requests.get(
             f"{KOTAK_BASE}/Orders/2.0/quick/user/trades",
-            headers=kotak_headers(),
-            timeout=10,
+            headers=kotak_headers(), timeout=10,
         )
-        data  = r.json()
+        data = safe_json(r)
+        if data is None:
+            return (
+                "\u274c *KotakNeo: Session expired*\n"
+                "Update `KOTAK_ACCESS_TOKEN` in your `.env` file and restart."
+            )
         trades = data.get("data", {}).get("trade_book", [])
         if not trades:
             return "\U0001f4d2 No trades today."
-        lines = [f"\U0001f4d2 *Trade History ({len(trades)} trades)*",
-                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
-        for t in trades[:20]:  # Max 20
+        lines = [f"\U0001f4d2 *Trade History ({len(trades)} trades)*", "\u2501" * 22]
+        for t in trades[:20]:
             sym  = t.get("tradingSymbol", "?")
             qty  = t.get("filledShares", t.get("qty", 0))
             px   = float(t.get("price", 0))
@@ -406,15 +487,17 @@ def kotak_get_trades() -> str:
         return f"\u274c Trade history error: {e}"
 
 def kotak_get_pnl() -> str:
-    """GET today's P&L — READ ONLY."""
+    if _kotak_token_missing():
+        return "\u274c KotakNeo not connected. Set KOTAK_ACCESS_TOKEN in .env"
     try:
         r = requests.get(
             f"{KOTAK_BASE}/Orders/2.0/quick/user/positions",
-            headers=kotak_headers(),
-            timeout=10,
+            headers=kotak_headers(), timeout=10,
         )
-        data = r.json()
-        positions = data.get("data", {}).get("net", [])
+        data = safe_json(r)
+        if data is None:
+            return "\u274c KotakNeo: Session expired. Update KOTAK_ACCESS_TOKEN in .env"
+        positions  = data.get("data", {}).get("net", [])
         total_pnl  = sum(float(p.get("pnl", 0)) for p in positions)
         realised   = sum(float(p.get("realisedPnl",   0)) for p in positions)
         unrealised = sum(float(p.get("unrealisedPnl", 0)) for p in positions)
@@ -441,6 +524,7 @@ def ai_analysis(symbol: str, d: pd.Series, category: str,
         change = ((float(d["Close"]) - float(d["prev_close"])) / float(d["prev_close"])) * 100
         unit   = price_unit(symbol)
         news_block = f"\n--- MARKET NEWS (@REDBOXINDIA) ---\n{news_context}" if news_context else ""
+        sma200_val = "N/A" if pd.isna(d["sma200"]) else f"{float(d['sma200']):.4f}"
         prompt = f"""
 You are the Chief Investment Officer of a world-class quant hedge fund.
 
@@ -451,7 +535,7 @@ TIMEFRAME  : 15-minute candles
 
 --- TREND ---
 EMA9={float(d['ema9']):.4f}  EMA21={float(d['ema21']):.4f}
-SMA50={float(d['sma50']):.4f}  SMA200={float(d['sma200']):.4f}
+SMA50={float(d['sma50']):.4f}  SMA200={sma200_val}
 ADX={float(d['adx']):.1f} (+DI={float(d['adx_pos']):.1f} / -DI={float(d['adx_neg']):.1f})
 
 --- MOMENTUM ---
@@ -509,6 +593,7 @@ def ai_deep_signal(symbol: str, d: pd.Series, category: str,
         unit   = price_unit(symbol)
         news_block = f"\n--- MARKET NEWS (@REDBOXINDIA) ---\n{news_context}" if news_context else ""
         opt_block  = f"\nOPTION REQUESTED: {option_desc}\nAnalyse whether this option is worth buying based on underlying movement." if is_option else ""
+        sma200_val = "N/A" if pd.isna(d["sma200"]) else f"{float(d['sma200']):.4f}"
 
         prompt = f"""
 You are a senior Indian market analyst and options trader at a top hedge fund.
@@ -521,7 +606,7 @@ TIMEFRAME   : 15-minute candles (intraday)
 
 --- TREND INDICATORS ---
 EMA9  = {float(d['ema9']):.4f}  |  EMA21 = {float(d['ema21']):.4f}
-SMA50 = {float(d['sma50']):.4f}  |  SMA200= {float(d['sma200']):.4f}
+SMA50 = {float(d['sma50']):.4f}  |  SMA200= {sma200_val}
 ADX   = {float(d['adx']):.1f}  (+DI={float(d['adx_pos']):.1f}  -DI={float(d['adx_neg']):.1f})
 
 --- MOMENTUM INDICATORS ---
@@ -643,9 +728,9 @@ def format_deep_signal(symbol: str, sig: dict, is_option: bool = False,
         f"\U0001f4cd *Entry Zone  :* `{unit}{sig.get('entry_low',0):.4f}` \u2014 `{unit}{sig.get('entry_high',0):.4f}`\n"
         f"\U0001f6d1 *Stop Loss   :* `{unit}{sig.get('sl',0):.4f}`\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f3af *Target 1    :* `{unit}{sig.get('tp1',0):.4f}` _(R:R 1:{rr1:.1f} — book 40%)_\n"
-        f"\U0001f3af *Target 2    :* `{unit}{sig.get('tp2',0):.4f}` _(R:R 1:{rr2:.1f} — book 40%)_\n"
-        f"\U0001f3af *Target 3    :* `{unit}{sig.get('tp3',0):.4f}` _(R:R 1:{rr3:.1f} — trail rest)_\n"
+        f"\U0001f3af *Target 1    :* `{unit}{sig.get('tp1',0):.4f}` _(R:R 1:{rr1:.1f} \u2014 book 40%)_\n"
+        f"\U0001f3af *Target 2    :* `{unit}{sig.get('tp2',0):.4f}` _(R:R 1:{rr2:.1f} \u2014 book 40%)_\n"
+        f"\U0001f3af *Target 3    :* `{unit}{sig.get('tp3',0):.4f}` _(R:R 1:{rr3:.1f} \u2014 trail rest)_\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
         f"\U0001f30d *Market      :* {sig.get('market_context','')}\n"
         f"\U0001f4dd *Thesis      :* {sig.get('rationale','')}\n"
@@ -667,8 +752,6 @@ def send_signal_alert(symbol: str, sig: dict):
     categ = category_emoji(cat)
     risk  = sig.get("risk", "MEDIUM")
     re_   = risk_emoji(risk)
-    rr    = abs(sig.get("tp2", sig.get("tp", 0)) - sig.get("entry_high", sig.get("entry", 0))) / \
-            max(abs(sig.get("entry_high", sig.get("entry", 1)) - sig.get("sl", 0)), 0.01)
     why_block = ""
     for b in sig.get("why", []):
         why_block += f"  \u2022 {b}\n"
@@ -732,7 +815,6 @@ def handle_signal_command(query: str):
         )
         return
 
-    # Detect options pattern: <SYMBOL> <STRIKE> <CE/PE>
     opt_match = re.match(r"^(.+?)\s+(\d+)\s+(CE|PE)$", query, re.IGNORECASE)
     is_option  = bool(opt_match)
     option_desc = ""
@@ -744,10 +826,8 @@ def handle_signal_command(query: str):
         opt_type    = opt_match.group(3).upper()
         option_desc = f"{base_query.upper()} {strike} {opt_type}"
 
-    # Resolve symbol
     symbol = SHORT_ALIAS.get(base_query.upper()) or SHORT_ALIAS.get(base_query.upper().replace(" ", ""))
     if not symbol:
-        # Try partial match
         for k, v in SHORT_ALIAS.items():
             if base_query.upper() in k:
                 symbol = v; break
@@ -767,18 +847,18 @@ def handle_signal_command(query: str):
     _tg_post(f"\u23f3 *Analysing {option_desc if is_option else symbol}...* Fetching data & running AI \u2014 10-20 sec")
 
     try:
-        df = yf.download(ticker, period=SCAN_PERIOD, interval=INTERVAL,
-                         progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50:
+        # FIX 1: use safe_download() which flattens MultiIndex automatically
+        df = safe_download(ticker)
+        if df is None or len(df) < 50:
             _tg_post(f"\u274c Insufficient data for `{symbol}`. Try again in a few minutes."); return
 
         data = compute_indicators(df)
         if data is None:
             _tg_post(f"\u274c Could not compute indicators for `{symbol}`."); return
 
-        cat         = SYMBOL_CATEGORY.get(symbol, "NSE Stock")
-        news        = get_redbox_news(5)
-        news_ctx    = "\n".join(news) if news else ""
+        cat      = SYMBOL_CATEGORY.get(symbol, "NSE Stock")
+        news     = get_redbox_news(5)
+        news_ctx = "\n".join(news) if news else ""
 
         sig = ai_deep_signal(symbol, data, cat,
                              news_context=news_ctx,
@@ -803,9 +883,9 @@ def is_on_cooldown(symbol: str) -> bool:
 
 def scan_symbol(name: str, ticker: str):
     try:
-        df = yf.download(ticker, period=SCAN_PERIOD, interval=INTERVAL,
-                         progress=False, auto_adjust=True)
-        if df.empty or len(df) < 50: return
+        # FIX 1: use safe_download() which flattens MultiIndex automatically
+        df = safe_download(ticker)
+        if df is None or len(df) < 50: return
         data = compute_indicators(df)
         if data is None: return
         cat  = SYMBOL_CATEGORY.get(name, "NSE Stock")
@@ -846,14 +926,13 @@ def poll_telegram_commands():
                 cmd = text.lower()
                 log.info(f"CMD: {text}")
 
-                # /signal — on-demand deep analysis
                 if cmd.startswith("/signal"):
                     query = text[7:].strip()
                     threading.Thread(target=handle_signal_command, args=(query,), daemon=True).start()
 
                 elif cmd in ["/start", "/help"]:
                     _tg_post(
-                        "\U0001f916 *TradingBot v3.3*\n"
+                        "\U0001f916 *TradingBot v3.4*\n"
                         "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         "\U0001f50d *On-Demand Analysis:*\n"
                         "  `/signal BTC`\n"
@@ -875,7 +954,7 @@ def poll_telegram_commands():
                     h, rem = divmod(int(uptime.total_seconds()), 3600)
                     m = rem // 60
                     _tg_post(
-                        f"\u2705 *TradingBot v3.3*\n"
+                        f"\u2705 *TradingBot v3.4*\n"
                         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
                         f"\U0001f550 Uptime     : {h}h {m}m\n"
                         f"\U0001f4ca Symbols    : {len(ALL_SYMBOLS)} total\n"
@@ -895,7 +974,7 @@ def poll_telegram_commands():
                         _tg_post("\U0001f4cb No auto signals today. Use `/signal BTC` for on-demand.")
                     else:
                         lines = [f"\U0001f4cb *Auto Signals Today ({len(daily_signals)})*",
-                                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                                 "\u2501" * 22]
                         for s in daily_signals:
                             e  = "\U0001f680" if s["signal"] == "BUY" else "\U0001f53b"
                             ce = category_emoji(SYMBOL_CATEGORY.get(s["symbol"], ""))
@@ -909,28 +988,19 @@ def poll_telegram_commands():
                     if not tweets:
                         _tg_post("\U0001f4f0 No tweets fetched. Add TWITTER_BEARER_TOKEN to .env\nFollow @REDBOXINDIA manually for now.")
                     else:
-                        lines = ["\U0001f4f0 *@REDBOXINDIA Latest News*",
-                                 "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                        lines = ["\U0001f4f0 *@REDBOXINDIA Latest News*", "\u2501" * 22]
                         for t in tweets:
                             lines.append(f"\u2022 {t}")
                         _tg_post("\n".join(lines))
 
-                elif cmd == "/portfolio":
-                    _tg_post(kotak_get_holdings())
-
-                elif cmd == "/positions":
-                    _tg_post(kotak_get_positions())
-
-                elif cmd == "/trades":
-                    _tg_post(kotak_get_trades())
-
-                elif cmd == "/pnl":
-                    _tg_post(kotak_get_pnl())
+                elif cmd == "/portfolio": _tg_post(kotak_get_holdings())
+                elif cmd == "/positions": _tg_post(kotak_get_positions())
+                elif cmd == "/trades":    _tg_post(kotak_get_trades())
+                elif cmd == "/pnl":       _tg_post(kotak_get_pnl())
 
                 elif cmd in ["/indices", "/nse"]:
-                    lines = ["\U0001f4c8 *All Indian Indices*",
-                             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
-                    for n, t in NSE_INDICES.items():
+                    lines = ["\U0001f4c8 *All Indian Indices*", "\u2501" * 22]
+                    for n in NSE_INDICES:
                         lines.append(f"  \u2022 {n}  \u2014  use `/signal {n}`")
                     _tg_post("\n".join(lines))
 
@@ -946,21 +1016,19 @@ def poll_telegram_commands():
                         "\U0001f4e6 Others": ["LT","ULTRACEMCO","ASIANPAINT","TITAN","ZOMATO","PAYTM"],
                     }
                     lines = [f"\U0001f3e2 *NSE Stocks ({len(NSE_STOCKS)})*  \u2014  use `/signal <name>`",
-                             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                             "\u2501" * 22]
                     for sec, syms in sects.items():
                         lines.append(f"\n*{sec}:*  " + "  ".join(syms))
                     _tg_post("\n".join(lines))
 
                 elif cmd == "/mcx":
-                    lines = ["\U0001faa8 *MCX Commodities*  \u2014  use `/signal GOLD` etc.",
-                             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                    lines = ["\U0001faa8 *MCX Commodities*  \u2014  use `/signal GOLD` etc.", "\u2501" * 22]
                     for n in MCX_COMMODITIES:
                         lines.append(f"  \u2022 {n}  \u2014  `/signal {n.split()[0]}`")
                     _tg_post("\n".join(lines))
 
                 elif cmd == "/crypto":
-                    lines = [f"\U0001fa99 *Crypto ({len(CRYPTO)}) 24/7*  \u2014  use `/signal BTC` etc.",
-                             "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501"]
+                    lines = [f"\U0001fa99 *Crypto ({len(CRYPTO)}) 24/7*  \u2014  use `/signal BTC` etc.", "\u2501" * 22]
                     row = []
                     for n in CRYPTO:
                         row.append(n)
@@ -1000,21 +1068,22 @@ def poll_telegram_commands():
 def main():
     global summary_sent_today, daily_signals
     if not GEMINI_API_KEY:
-        log.critical("GEMINI_API_KEY missing"); raise SystemExit(1)
+        log.critical("GEMINI_API_KEY missing in .env"); raise SystemExit(1)
     genai.configure(api_key=GEMINI_API_KEY)
 
     log.info("=" * 58)
-    log.info("  TradingBot v3.3  —  Full Professional Grade")
+    log.info("  TradingBot v3.4  —  All fixes applied")
     log.info(f"  {len(ALL_SYMBOLS)} symbols | /signal on-demand | KotakNeo RO | @REDBOXINDIA")
     log.info("=" * 58)
 
     _tg_post(
-        f"\u2705 *TradingBot v3.3 Online*\n"
+        f"\u2705 *TradingBot v3.4 Online*\n"
         f"\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n"
-        f"\U0001f4ca {len(ALL_SYMBOLS)} symbols auto-scanned every 15 min\n"
-        f"\U0001f50d On-demand: `/signal BTC`  `/signal NIFTY 24000 CE`\n"
-        f"\U0001fa99 KotakNeo read-only connected\n"
-        f"\U0001f4f0 @REDBOXINDIA news context active\n"
+        f"\U0001f527 *Fixes applied:*\n"
+        f"  \u2705 /signal BTC (yfinance MultiIndex fixed)\n"
+        f"  \u2705 /trades (Kotak JSON guard — no crash)\n"
+        f"  \u2705 KOTAK_API_KEY hardcode removed\n"
+        f"\U0001f4ca {len(ALL_SYMBOLS)} symbols | `/signal BTC` | `/signal NIFTY 24000 CE`\n"
         f"Type /start for all commands."
     )
 
