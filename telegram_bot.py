@@ -1,38 +1,33 @@
 #!/usr/bin/env python3
 """
-Full-featured Telegram Trading Signal Bot
+TradingBot v3 - Full Telegram Signal Bot
+
 Commands:
-  /signal <SYMBOL>           - Full signal for stocks/crypto/options
-  /signal <SYMBOL> <STRIKE> <CE/PE>  - Options signal
-  /chart <SYMBOL>            - Mini text chart + trend
-  /watchlist                 - Signal scan on all watchlist symbols
-  /status                    - Bot health + market status
-  /help                      - All commands
+  /signal              → Auto-scan ALL symbols, show only actionable ones
+  /signal BTC          → Full detailed signal for one symbol
+  /signal NIFTY 24000 CE  → Options signal with entry price, risk meter, T1/T2/T3, SL
+  /signal NIFTY 24000 PE  → Put options signal
+  /chart SYM           → Mini ASCII chart + trend
+  /watchlist           → Quick table scan of all symbols
+  /status              → Bot health + market hours
+  /help                → All commands
 """
 
-import os
-import sys
-import logging
-import asyncio
-import traceback
+import os, sys, logging, traceback
 from datetime import datetime, time as dtime
 import pytz
-
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from telegram import Update, BotCommand
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes, MessageHandler, filters
-)
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.constants import ParseMode
 
 load_dotenv()
 
-# ─── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 TELEGRAM_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHATID = os.getenv("TELEGRAM_CHAT_ID", "")
 IST = pytz.timezone("Asia/Kolkata")
 
 logging.basicConfig(
@@ -42,629 +37,518 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# ─── Symbol resolver ──────────────────────────────────────────────────────────
+# ── Symbol Map ────────────────────────────────────────────────────────────────
 SYMBOL_MAP = {
     # Indian indices
-    "NIFTY":    "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
-    "SENSEX":   "^BSESN",
-    "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
-    "MIDCAP":   "^NSEMDCP50",
+    "NIFTY":      "^NSEI",
+    "BANKNIFTY":  "^NSEBANK",
+    "SENSEX":     "^BSESN",
+    "FINNIFTY":   "NIFTY_FIN_SERVICE.NS",
+    "MIDCAP":     "^NSEMDCP50",
     # Indian stocks
-    "RELIANCE": "RELIANCE.NS",
-    "TCS":      "TCS.NS",
-    "INFY":     "INFY.NS",
-    "HDFC":     "HDFCBANK.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "SBIN":     "SBIN.NS",
-    "WIPRO":    "WIPRO.NS",
+    "RELIANCE":   "RELIANCE.NS",
+    "TCS":        "TCS.NS",
+    "INFY":       "INFY.NS",
+    "HDFC":       "HDFCBANK.NS",
+    "HDFCBANK":   "HDFCBANK.NS",
+    "ICICIBANK":  "ICICIBANK.NS",
+    "SBIN":       "SBIN.NS",
+    "WIPRO":      "WIPRO.NS",
     "BAJFINANCE": "BAJFINANCE.NS",
     "TATAMOTORS": "TATAMOTORS.NS",
-    "ADANIENT": "ADANIENT.NS",
-    "MARUTI":   "MARUTI.NS",
-    "SUNPHARMA": "SUNPHARMA.NS",
-    "AXISBANK": "AXISBANK.NS",
-    "LT":       "LT.NS",
-    "TITAN":    "TITAN.NS",
-    "ULTRACEMCO": "ULTRACEMCO.NS",
+    "ADANIENT":   "ADANIENT.NS",
+    "MARUTI":     "MARUTI.NS",
+    "SUNPHARMA":  "SUNPHARMA.NS",
+    "AXISBANK":   "AXISBANK.NS",
+    "LT":         "LT.NS",
+    "TITAN":      "TITAN.NS",
     # Crypto
-    "BTC":      "BTC-USD",
-    "ETH":      "ETH-USD",
-    "BNB":      "BNB-USD",
-    "SOL":      "SOL-USD",
-    "XRP":      "XRP-USD",
-    "ADA":      "ADA-USD",
-    "DOGE":     "DOGE-USD",
-    "AVAX":     "AVAX-USD",
-    "MATIC":    "MATIC-USD",
-    "DOT":      "DOT-USD",
+    "BTC":   "BTC-USD",
+    "ETH":   "ETH-USD",
+    "BNB":   "BNB-USD",
+    "SOL":   "SOL-USD",
+    "XRP":   "XRP-USD",
+    "ADA":   "ADA-USD",
+    "DOGE":  "DOGE-USD",
+    "AVAX":  "AVAX-USD",
+    "MATIC": "MATIC-USD",
     # US stocks
-    "AAPL":     "AAPL",
-    "TSLA":     "TSLA",
-    "NVDA":     "NVDA",
-    "AMZN":     "AMZN",
-    "GOOGL":    "GOOGL",
-    "MSFT":     "MSFT",
-    "META":     "META",
+    "AAPL":  "AAPL",
+    "TSLA":  "TSLA",
+    "NVDA":  "NVDA",
+    "AMZN":  "AMZN",
+    "GOOGL": "GOOGL",
+    "MSFT":  "MSFT",
+    "META":  "META",
 }
 
-WATCHLIST = ["NIFTY", "BANKNIFTY", "RELIANCE", "TCS", "BTC", "ETH", "TSLA", "NVDA"]
+# Full auto-scan list (used when /signal is typed alone)
+ALL_SYMBOLS = [
+    "NIFTY", "BANKNIFTY", "SENSEX",
+    "RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN",
+    "WIPRO", "BAJFINANCE", "TATAMOTORS", "AXISBANK",
+    "BTC", "ETH", "SOL", "BNB",
+    "TSLA", "NVDA", "AAPL", "META",
+]
 
-def resolve_symbol(sym: str) -> str:
+def resolve(sym: str) -> str:
     s = sym.upper().strip()
-    return SYMBOL_MAP.get(s, s if "-" in s or "." in s else s)
+    return SYMBOL_MAP.get(s, s)
 
-# ─── Indicator Engine ─────────────────────────────────────────────────────────
-def fetch_data(ticker: str, period="3mo", interval="1h") -> pd.DataFrame | None:
+# ── Data Fetch ────────────────────────────────────────────────────────────────
+def fetch(ticker: str) -> pd.DataFrame | None:
     try:
-        df = yf.download(ticker, period=period, interval=interval,
-                         auto_adjust=True, progress=False)
+        df = yf.download(ticker, period="3mo", interval="1h",
+                         auto_adjust=True, progress=False, threads=False)
         if df is None or len(df) < 30:
-            # fallback to daily
             df = yf.download(ticker, period="6mo", interval="1d",
-                             auto_adjust=True, progress=False)
+                             auto_adjust=True, progress=False, threads=False)
         if df is None or len(df) < 20:
             return None
         df.dropna(inplace=True)
         return df
     except Exception:
-        log.error(traceback.format_exc())
         return None
 
-def calc_indicators(df: pd.DataFrame) -> dict:
-    close = df["Close"].squeeze()
-    high  = df["High"].squeeze()
-    low   = df["Low"].squeeze()
-    vol   = df["Volume"].squeeze() if "Volume" in df.columns else pd.Series(dtype=float)
-
-    # ── RSI ──
-    delta = close.diff()
-    gain  = delta.clip(lower=0).rolling(14).mean()
-    loss  = (-delta.clip(upper=0)).rolling(14).mean()
-    rs    = gain / loss.replace(0, np.nan)
-    rsi   = 100 - (100 / (1 + rs))
-
-    # ── MACD ──
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    macd  = ema12 - ema26
-    signal= macd.ewm(span=9).mean()
-    hist  = macd - signal
-
-    # ── EMA stack ──
-    ema9  = close.ewm(span=9).mean()
-    ema20 = close.ewm(span=20).mean()
-    ema50 = close.ewm(span=50).mean()
-    ema200= close.ewm(span=200).mean()
-
-    # ── Bollinger Bands ──
-    sma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    bb_up = sma20 + 2 * std20
-    bb_lo = sma20 - 2 * std20
-    bb_pct= (close - bb_lo) / (bb_up - bb_lo + 1e-9)
-
-    # ── Stochastic ──
-    lo14 = low.rolling(14).min()
-    hi14 = high.rolling(14).max()
-    stoch_k = 100 * (close - lo14) / (hi14 - lo14 + 1e-9)
-    stoch_d = stoch_k.rolling(3).mean()
-
-    # ── ATR ──
-    tr = pd.concat([
-        (high - low),
-        (high - close.shift()).abs(),
-        (low  - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
-
-    # ── ADX ──
-    up_move  = high.diff()
-    dn_move  = -low.diff()
-    plus_dm  = np.where((up_move > dn_move) & (up_move > 0), up_move, 0.0)
-    minus_dm = np.where((dn_move > up_move) & (dn_move > 0), dn_move, 0.0)
-    atr14    = tr.rolling(14).mean()
-    plus_di  = 100 * pd.Series(plus_dm,  index=df.index).rolling(14).mean() / (atr14 + 1e-9)
-    minus_di = 100 * pd.Series(minus_dm, index=df.index).rolling(14).mean() / (atr14 + 1e-9)
-    dx       = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-9)
-    adx      = dx.rolling(14).mean()
-
-    # ── CCI ──
-    tp   = (high + low + close) / 3
-    cci  = (tp - tp.rolling(20).mean()) / (0.015 * tp.rolling(20).std() + 1e-9)
-
-    # ── OBV ──
-    if not vol.empty:
-        obv = (np.sign(close.diff()) * vol).fillna(0).cumsum()
-        obv_slope = obv.diff(5).iloc[-1]
-    else:
-        obv_slope = 0
-
-    # ── Support / Resistance ──
-    pivot  = (high.iloc[-20:].max() + low.iloc[-20:].min() + close.iloc[-1]) / 3
-    r1 = 2 * pivot - low.iloc[-20:].min()
-    r2 = pivot + (high.iloc[-20:].max() - low.iloc[-20:].min())
-    s1 = 2 * pivot - high.iloc[-20:].max()
-    s2 = pivot - (high.iloc[-20:].max() - low.iloc[-20:].min())
-
-    return {
-        "close":    float(close.iloc[-1]),
-        "rsi":      float(rsi.iloc[-1]),
-        "macd":     float(macd.iloc[-1]),
-        "macd_sig": float(signal.iloc[-1]),
-        "macd_hist":float(hist.iloc[-1]),
-        "ema9":     float(ema9.iloc[-1]),
-        "ema20":    float(ema20.iloc[-1]),
-        "ema50":    float(ema50.iloc[-1]),
-        "ema200":   float(ema200.iloc[-1]),
-        "bb_pct":   float(bb_pct.iloc[-1]),
-        "bb_up":    float(bb_up.iloc[-1]),
-        "bb_lo":    float(bb_lo.iloc[-1]),
-        "stoch_k":  float(stoch_k.iloc[-1]),
-        "stoch_d":  float(stoch_d.iloc[-1]),
-        "atr":      float(atr.iloc[-1]),
-        "adx":      float(adx.iloc[-1]),
-        "plus_di":  float(plus_di.iloc[-1]),
-        "minus_di": float(minus_di.iloc[-1]),
-        "cci":      float(cci.iloc[-1]),
-        "obv_slope":float(obv_slope),
-        "pivot":    float(pivot),
-        "r1":       float(r1),
-        "r2":       float(r2),
-        "s1":       float(s1),
-        "s2":       float(s2),
-        "high20":   float(high.iloc[-20:].max()),
-        "low20":    float(low.iloc[-20:].min()),
-    }
-
-# ─── Signal Generator ─────────────────────────────────────────────────────────
-def generate_signal(ind: dict, is_options: bool = False,
-                    opt_type: str = "", strike: float = 0) -> dict:
-    score_bull = 0
-    score_bear = 0
-    reasons_bull = []
-    reasons_bear = []
-
-    c     = ind["close"]
-    rsi   = ind["rsi"]
-    macd  = ind["macd"]
-    msig  = ind["macd_sig"]
-    mhist = ind["macd_hist"]
-    adx   = ind["adx"]
-    atr   = ind["atr"]
-    cci   = ind["cci"]
-    stk   = ind["stoch_k"]
-    std   = ind["stoch_d"]
-    bb    = ind["bb_pct"]
+# ── Indicators ────────────────────────────────────────────────────────────────
+def indicators(df: pd.DataFrame) -> dict:
+    c   = df["Close"].squeeze()
+    h   = df["High"].squeeze()
+    l   = df["Low"].squeeze()
+    vol = df["Volume"].squeeze() if "Volume" in df.columns else pd.Series(dtype=float)
 
     # RSI
-    if rsi < 30:
-        score_bull += 3; reasons_bull.append(f"RSI oversold ({rsi:.1f})")
-    elif rsi < 45:
-        score_bull += 1; reasons_bull.append(f"RSI low ({rsi:.1f})")
-    elif rsi > 70:
-        score_bear += 3; reasons_bear.append(f"RSI overbought ({rsi:.1f})")
-    elif rsi > 55:
-        score_bear += 1; reasons_bear.append(f"RSI high ({rsi:.1f})")
+    d  = c.diff()
+    g  = d.clip(lower=0).rolling(14).mean()
+    ls = (-d.clip(upper=0)).rolling(14).mean()
+    rsi = 100 - 100 / (1 + g / ls.replace(0, np.nan))
 
     # MACD
-    if macd > msig and mhist > 0:
-        score_bull += 2; reasons_bull.append("MACD bullish crossover")
-    elif macd < msig and mhist < 0:
-        score_bear += 2; reasons_bear.append("MACD bearish crossover")
+    e12 = c.ewm(span=12).mean(); e26 = c.ewm(span=26).mean()
+    macd = e12 - e26; msig = macd.ewm(span=9).mean(); mhist = macd - msig
 
-    # EMA stack
-    if ind["ema9"] > ind["ema20"] > ind["ema50"]:
-        score_bull += 2; reasons_bull.append("EMA9>EMA20>EMA50 bull stack")
-    elif ind["ema9"] < ind["ema20"] < ind["ema50"]:
-        score_bear += 2; reasons_bear.append("EMA9<EMA20<EMA50 bear stack")
+    # EMAs
+    e9  = c.ewm(span=9).mean()
+    e20 = c.ewm(span=20).mean()
+    e50 = c.ewm(span=50).mean()
+    e200= c.ewm(span=200).mean()
 
-    # Price vs EMA200
-    if c > ind["ema200"]:
-        score_bull += 1; reasons_bull.append("Price above EMA200")
-    else:
-        score_bear += 1; reasons_bear.append("Price below EMA200")
-
-    # ADX / DI
-    if adx > 25:
-        if ind["plus_di"] > ind["minus_di"]:
-            score_bull += 2; reasons_bull.append(f"ADX strong trend bullish ({adx:.1f})")
-        else:
-            score_bear += 2; reasons_bear.append(f"ADX strong trend bearish ({adx:.1f})")
-
-    # Bollinger Bands
-    if bb < 0.15:
-        score_bull += 2; reasons_bull.append(f"Near BB lower band")
-    elif bb > 0.85:
-        score_bear += 2; reasons_bear.append(f"Near BB upper band")
+    # Bollinger
+    s20  = c.rolling(20).mean(); std20 = c.rolling(20).std()
+    bb_u = s20 + 2*std20; bb_l = s20 - 2*std20
+    bb_p = (c - bb_l) / (bb_u - bb_l + 1e-9)
 
     # Stochastic
-    if stk < 20 and std < 20:
-        score_bull += 2; reasons_bull.append(f"Stoch oversold ({stk:.1f})")
-    elif stk > 80 and std > 80:
-        score_bear += 2; reasons_bear.append(f"Stoch overbought ({stk:.1f})")
+    l14 = l.rolling(14).min(); h14 = h.rolling(14).max()
+    sk = 100*(c-l14)/(h14-l14+1e-9); sd = sk.rolling(3).mean()
+
+    # ATR
+    tr = pd.concat([(h-l),(h-c.shift()).abs(),(l-c.shift()).abs()],axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+
+    # ADX
+    um = h.diff(); dm = -l.diff()
+    pdm = np.where((um>dm)&(um>0), um, 0.0)
+    ndm = np.where((dm>um)&(dm>0), dm, 0.0)
+    a14 = tr.rolling(14).mean()
+    pdi = 100*pd.Series(pdm,index=df.index).rolling(14).mean()/(a14+1e-9)
+    ndi = 100*pd.Series(ndm,index=df.index).rolling(14).mean()/(a14+1e-9)
+    adx = (100*(pdi-ndi).abs()/(pdi+ndi+1e-9)).rolling(14).mean()
 
     # CCI
-    if cci < -100:
-        score_bull += 1; reasons_bull.append(f"CCI oversold ({cci:.0f})")
-    elif cci > 100:
-        score_bear += 1; reasons_bear.append(f"CCI overbought ({cci:.0f})")
+    tp  = (h+l+c)/3
+    cci = (tp - tp.rolling(20).mean())/(0.015*tp.rolling(20).std()+1e-9)
 
     # OBV
-    if ind["obv_slope"] > 0:
-        score_bull += 1; reasons_bull.append("OBV rising (buy pressure)")
-    elif ind["obv_slope"] < 0:
-        score_bear += 1; reasons_bear.append("OBV falling (sell pressure)")
+    obv_slope = 0.0
+    if not vol.empty and len(vol) > 5:
+        obv = (np.sign(c.diff())*vol).fillna(0).cumsum()
+        obv_slope = float(obv.diff(5).iloc[-1])
 
-    total = score_bull + score_bear
-    if total == 0:
-        confidence = 50
-        direction  = "NEUTRAL"
+    # Pivot / S/R
+    h20  = h.iloc[-20:].max(); l20 = l.iloc[-20:].min(); c0 = float(c.iloc[-1])
+    piv  = (h20+l20+c0)/3
+    r1   = 2*piv - l20;  r2 = piv+(h20-l20)
+    s1   = 2*piv - h20;  s2 = piv-(h20-l20)
+
+    return dict(
+        close=c0, rsi=float(rsi.iloc[-1]), macd=float(macd.iloc[-1]),
+        macd_sig=float(msig.iloc[-1]), macd_hist=float(mhist.iloc[-1]),
+        e9=float(e9.iloc[-1]), e20=float(e20.iloc[-1]),
+        e50=float(e50.iloc[-1]), e200=float(e200.iloc[-1]),
+        bb_p=float(bb_p.iloc[-1]), bb_u=float(bb_u.iloc[-1]), bb_l=float(bb_l.iloc[-1]),
+        sk=float(sk.iloc[-1]), sd=float(sd.iloc[-1]),
+        atr=float(atr.iloc[-1]), adx=float(adx.iloc[-1]),
+        pdi=float(pdi.iloc[-1]), ndi=float(ndi.iloc[-1]),
+        cci=float(cci.iloc[-1]), obv_slope=obv_slope,
+        piv=piv, r1=r1, r2=r2, s1=s1, s2=s2,
+        h20=float(h20), l20=float(l20),
+    )
+
+# ── Signal Engine ─────────────────────────────────────────────────────────────
+def signal(ind: dict, opt_type: str = "") -> dict:
+    sb, ss, rb, rs = 0, 0, [], []
+    c   = ind["close"]
+    rsi = ind["rsi"]; macd = ind["macd"]; ms = ind["macd_sig"]
+    adx = ind["adx"]; atr  = ind["atr"];  cci = ind["cci"]
+    sk  = ind["sk"];  sd   = ind["sd"];    bb  = ind["bb_p"]
+
+    # ── scoring ──
+    if rsi < 30:   sb+=3; rb.append(f"RSI oversold {rsi:.1f}")
+    elif rsi < 45: sb+=1; rb.append(f"RSI low {rsi:.1f}")
+    elif rsi > 70: ss+=3; rs.append(f"RSI overbought {rsi:.1f}")
+    elif rsi > 55: ss+=1; rs.append(f"RSI high {rsi:.1f}")
+
+    if macd > ms and ind["macd_hist"] > 0: sb+=2; rb.append("MACD bullish crossover")
+    elif macd < ms and ind["macd_hist"] < 0: ss+=2; rs.append("MACD bearish crossover")
+
+    if ind["e9"]>ind["e20"]>ind["e50"]: sb+=2; rb.append("EMA bull stack 9>20>50")
+    elif ind["e9"]<ind["e20"]<ind["e50"]: ss+=2; rs.append("EMA bear stack 9<20<50")
+
+    if c > ind["e200"]: sb+=1; rb.append("Above EMA200")
+    else: ss+=1; rs.append("Below EMA200")
+
+    if adx > 25:
+        if ind["pdi"] > ind["ndi"]: sb+=2; rb.append(f"ADX {adx:.1f} trending bull")
+        else: ss+=2; rs.append(f"ADX {adx:.1f} trending bear")
+
+    if bb < 0.15: sb+=2; rb.append("Near BB lower band (oversold)")
+    elif bb > 0.85: ss+=2; rs.append("Near BB upper band (overbought)")
+
+    if sk < 20 and sd < 20: sb+=2; rb.append(f"Stoch oversold {sk:.1f}")
+    elif sk > 80 and sd > 80: ss+=2; rs.append(f"Stoch overbought {sk:.1f}")
+
+    if cci < -100: sb+=1; rb.append(f"CCI oversold {cci:.0f}")
+    elif cci > 100: ss+=1; rs.append(f"CCI overbought {cci:.0f}")
+
+    if ind["obv_slope"] > 0: sb+=1; rb.append("OBV rising — buy pressure")
+    elif ind["obv_slope"] < 0: ss+=1; rs.append("OBV falling — sell pressure")
+
+    total = sb + ss
+    conf  = int(max(sb,ss)/total*100) if total else 50
+    raw   = "BUY" if sb > ss else ("SELL" if ss > sb else "NEUTRAL")
+    dir_  = raw
+
+    # Options direction label
+    if opt_type == "CE":
+        dir_ = "BUY CE ✅ (Underlying Bullish)" if raw=="BUY" else "AVOID CE ❌ (Underlying Bearish)"
+    elif opt_type == "PE":
+        dir_ = "BUY PE ✅ (Underlying Bearish)" if raw=="SELL" else "AVOID PE ❌ (Underlying Bullish)"
+
+    # ── Levels ──
+    if raw == "BUY":
+        entry = round(c * 1.0015, 2)
+        sl    = round(max(c - 2.0*atr, ind["s1"]), 2)
+        t1    = round(entry + 1.5*atr, 2)
+        t2    = round(entry + 2.5*atr, 2)
+        t3    = round(entry + 4.0*atr, 2)
     else:
-        confidence = int(max(score_bull, score_bear) / total * 100)
-        direction  = "BUY" if score_bull > score_bear else "SELL"
+        entry = round(c * 0.9985, 2)
+        sl    = round(min(c + 2.0*atr, ind["r1"]), 2)
+        t1    = round(entry - 1.5*atr, 2)
+        t2    = round(entry - 2.5*atr, 2)
+        t3    = round(entry - 4.0*atr, 2)
 
-    # For options: flip if PE
-    if is_options:
-        if opt_type == "PE" and direction == "BUY":
-            direction = "BUY PE (Bearish Underlying)"
-        elif opt_type == "CE" and direction == "SELL":
-            direction = "SELL CE (Bearish)" 
-        elif opt_type == "CE" and direction == "BUY":
-            direction = "BUY CE (Bullish Underlying)"
-        elif opt_type == "PE" and direction == "SELL":
-            direction = "SELL PE (Bullish)"
+    risk = abs(entry - sl)
+    rr1  = round(abs(t1-entry)/risk, 2) if risk else 0
+    rr3  = round(abs(t3-entry)/risk, 2) if risk else 0
 
-    # ─── Targets & SL ─────────────────────────────────────────────────────────
-    multiplier = 1 if "BUY" in direction.upper() else -1
-
-    if "BUY" in direction.upper():
-        entry   = c * 1.001                     # slight slippage
-        sl      = max(c - 2.0 * atr, ind["s1"])
-        t1      = entry + 1.5 * atr
-        t2      = entry + 2.5 * atr
-        t3      = entry + 4.0 * atr
+    # ── Risk meter (visual bar) ──
+    if conf >= 75 and adx > 25 and rr1 >= 1.5:
+        meter = "🟩🟩🟩🟩🟩  LOW RISK";      grade="LOW";    take=True
+        advice = "Strong setup ✅ — Full position size OK"
+    elif conf >= 65 and rr1 >= 1.2:
+        meter = "🟨🟨🟨🟩🟩  MEDIUM RISK";   grade="MEDIUM"; take=True
+        advice = "Good setup 🟡 — Use 50% position size"
+    elif conf >= 55:
+        meter = "🟧🟧🟧🟨🟩  HIGH RISK";     grade="HIGH";   take=False
+        advice = "Weak setup 🟠 — Wait for confirmation"
     else:
-        entry   = c * 0.999
-        sl      = min(c + 2.0 * atr, ind["r1"])
-        t1      = entry - 1.5 * atr
-        t2      = entry - 2.5 * atr
-        t3      = entry - 4.0 * atr
+        meter = "🟥🟥🟥🟥🟥  AVOID";         grade="AVOID";  take=False
+        advice = "No edge ❌ — Skip this trade"
 
-    risk    = abs(entry - sl)
-    reward1 = abs(t1 - entry)
-    reward3 = abs(t3 - entry)
-    rr1     = reward1 / risk if risk > 0 else 0
-    rr3     = reward3 / risk if risk > 0 else 0
+    reasons = rb if raw=="BUY" else rs
 
-    # Risk assessment
-    if confidence >= 75 and adx > 25 and rr1 >= 1.5:
-        risk_level = "🟢 LOW RISK"
-        take_trade = True
-        advice = "Strong setup. Consider full position."
-    elif confidence >= 65 and rr1 >= 1.2:
-        risk_level = "🟡 MEDIUM RISK"
-        take_trade = True
-        advice = "Decent setup. Use 50% position size."
-    elif confidence >= 55:
-        risk_level = "🟠 HIGH RISK"
-        take_trade = False
-        advice = "Weak setup. Avoid or wait for confirmation."
-    else:
-        risk_level = "🔴 AVOID"
-        take_trade = False
-        advice = "No clear edge. Skip this trade."
+    return dict(
+        dir=dir_, raw=raw, conf=conf,
+        entry=entry, sl=sl, t1=t1, t2=t2, t3=t3,
+        rr1=rr1, rr3=rr3,
+        meter=meter, grade=grade, take=take, advice=advice,
+        reasons=reasons[:5],
+        rsi=round(rsi,1), adx=round(adx,1), atr=round(atr,2),
+        piv=round(ind["piv"],2),
+        r1=round(ind["r1"],2), r2=round(ind["r2"],2),
+        s1=round(ind["s1"],2), s2=round(ind["s2"],2),
+    )
 
-    reasons = reasons_bull if "BUY" in direction.upper() else reasons_bear
+# ── Formatting helpers ────────────────────────────────────────────────────────
+def f(v: float, d=2) -> str:
+    return f"{v:,.{d}f}" if abs(v) >= 1000 else f"{v:.{d}f}"
 
-    return {
-        "direction":  direction,
-        "confidence": confidence,
-        "entry":      round(entry, 2),
-        "sl":         round(sl, 2),
-        "t1":         round(t1, 2),
-        "t2":         round(t2, 2),
-        "t3":         round(t3, 2),
-        "rr1":        round(rr1, 2),
-        "rr3":        round(rr3, 2),
-        "risk_level": risk_level,
-        "take_trade": take_trade,
-        "advice":     advice,
-        "reasons":    reasons[:5],
-        "atr":        round(atr, 2),
-        "adx":        round(adx, 2),
-        "rsi":        round(rsi, 2),
-        "pivot":      round(ind["pivot"], 2),
-        "r1":         round(ind["r1"], 2),
-        "r2":         round(ind["r2"], 2),
-        "s1":         round(ind["s1"], 2),
-        "s2":         round(ind["s2"], 2),
-    }
+def risk_bar(conf: int) -> str:
+    filled = round(conf / 10)
+    return "[" + "█"*filled + "░"*(10-filled) + f"] {conf}%"
 
-# ─── Formatting ───────────────────────────────────────────────────────────────
-def fmt(val: float, decimals: int = 2) -> str:
-    """Format number with commas for Indian readability."""
-    if val >= 1000:
-        return f"{val:,.{decimals}f}"
-    return f"{val:.{decimals}f}"
+def build_msg(sym: str, ticker: str, ind: dict, sig: dict,
+              opt_type: str = "", strike: float = 0) -> str:
+    now   = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
+    arrow = "🚀" if "BUY" in sig["raw"] else ("📉" if sig["raw"]=="SELL" else "⚖️")
 
-def build_signal_message(sym: str, ticker: str, ind: dict, sig: dict,
-                         is_options: bool = False, opt_type: str = "",
-                         strike: float = 0) -> str:
-    now = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
-
-    direction = sig["direction"]
-    arrow = "🚀" if "BUY" in direction.upper() else ("📉" if "SELL" in direction.upper() else "⚖️")
-
-    if is_options:
-        title = f"{sym} {int(strike)} {opt_type}"
-        asset_type = "📋 Options"
+    if opt_type:
+        title     = f"{sym} {int(strike)} {opt_type}"
+        asset_tag = "📋 NSE OPTIONS"
     elif "-USD" in ticker:
-        title = sym
-        asset_type = "₿ Crypto"
-    elif ".NS" in ticker or "^NSE" in ticker or "^BSE" in ticker:
-        title = sym
-        asset_type = "🇮🇳 Indian Market"
+        title     = sym;  asset_tag = "₿ CRYPTO"
+    elif any(x in ticker for x in [".NS","^NSE","^BSE"]):
+        title     = sym;  asset_tag = "🇮🇳 INDIAN MARKET"
     else:
-        title = sym
-        asset_type = "🇺🇸 US Market"
+        title     = sym;  asset_tag = "🇺🇸 US MARKET"
 
-    bar = "━" * 28
+    sep = "━" * 30
+    take_icon = "✅ YES — ENTER TRADE" if sig["take"] else "❌ NO — SKIP"
+    reasons_block = "".join(f"  • {r}\n" for r in sig["reasons"])
 
-    reasons_txt = ""
-    for r in sig["reasons"]:
-        reasons_txt += f"  • {r}\n"
-
-    trade_emoji = "✅" if sig["take_trade"] else "❌"
+    # Options note
+    opt_note = ""
+    if opt_type:
+        opt_note = (
+            f"\n📌 *OPTIONS NOTE*\n"
+            f"`{sep}`\n"
+            f"Strike: `{int(strike)} {opt_type}`\n"
+            f"Underlying trend: `{'BULLISH' if sig['raw']=='BUY' else 'BEARISH' if sig['raw']=='SELL' else 'NEUTRAL'}`\n"
+            f"→ {'BUY CE if underlying rises ✅' if opt_type=='CE' and sig['raw']=='BUY' else 'AVOID CE — underlying is bearish ❌' if opt_type=='CE' else 'BUY PE if underlying falls ✅' if opt_type=='PE' and sig['raw']=='SELL' else 'AVOID PE — underlying is bullish ❌'}\n"
+        )
 
     msg = (
-        f"{arrow} *{title} — {direction}*\n"
-        f"`{bar}`\n"
-        f"🕐 {now}\n"
-        f"{asset_type}\n\n"
-        f"*📊 SIGNAL DETAILS*\n"
-        f"`{bar}`\n"
-        f"💰 Current Price:  `{fmt(ind['close'])}`\n"
-        f"🎯 Entry Zone:     `{fmt(sig['entry'])}`\n"
-        f"🛑 Stop Loss:      `{fmt(sig['sl'])}`\n"
-        f"🎯 Target 1:       `{fmt(sig['t1'])}`\n"
-        f"🎯 Target 2:       `{fmt(sig['t2'])}`\n"
-        f"🎯 Target 3:       `{fmt(sig['t3'])}`\n\n"
-        f"*⚖️ RISK ANALYSIS*\n"
-        f"`{bar}`\n"
-        f"{sig['risk_level']}\n"
-        f"📈 Confidence:     `{sig['confidence']}%`\n"
-        f"⚖️ R:R (T1):       `1 : {sig['rr1']}`\n"
-        f"⚖️ R:R (T3):       `1 : {sig['rr3']}`\n"
-        f"{trade_emoji} Take Trade:    `{'YES' if sig['take_trade'] else 'NO'}`\n"
-        f"💡 Advice:         _{sig['advice']}_\n\n"
+        f"{arrow} *{title} — {sig['dir']}*\n"
+        f"`{sep}`\n"
+        f"🕐 {now} | {asset_tag}\n\n"
+
+        f"*📊 ENTRY DETAILS*\n"
+        f"`{sep}`\n"
+        f"💵 Current Price : `{f(ind['close'])}`\n"
+        f"🎯 Entry Zone    : `{f(sig['entry'])}`\n"
+        f"🛑 Stop Loss     : `{f(sig['sl'])}`  ← hard stop\n"
+        f"🎯 Target 1      : `{f(sig['t1'])}` ← book 40%\n"
+        f"🎯 Target 2      : `{f(sig['t2'])}` ← book 35%\n"
+        f"🎯 Target 3      : `{f(sig['t3'])}` ← trail rest\n\n"
+
+        f"*⚖️ RISK METER*\n"
+        f"`{sep}`\n"
+        f"`{risk_bar(sig['conf'])}`\n"
+        f"{sig['meter']}\n"
+        f"R:R (T1) : `1 : {sig['rr1']}`   R:R (T3) : `1 : {sig['rr3']}`\n"
+        f"Take Trade : *{take_icon}*\n"
+        f"💡 {sig['advice']}\n\n"
+
         f"*📐 TECHNICALS*\n"
-        f"`{bar}`\n"
-        f"RSI:  `{sig['rsi']}`   ADX: `{sig['adx']}`   ATR: `{fmt(sig['atr'])}`\n"
-        f"Pivot: `{fmt(sig['pivot'])}`\n"
-        f"R1: `{fmt(sig['r1'])}`   R2: `{fmt(sig['r2'])}`\n"
-        f"S1: `{fmt(sig['s1'])}`   S2: `{fmt(sig['s2'])}`\n\n"
-        f"*🧠 WHY THIS SIGNAL*\n"
-        f"`{bar}`\n"
-        f"{reasons_txt}"
-        f"\n⚠️ _Not financial advice. Trade responsibly._"
+        f"`{sep}`\n"
+        f"RSI `{sig['rsi']}` | ADX `{sig['adx']}` | ATR `{f(sig['atr'])}`\n"
+        f"Pivot `{f(sig['piv'])}` | R1 `{f(sig['r1'])}` | R2 `{f(sig['r2'])}`\n"
+        f"S1 `{f(sig['s1'])}` | S2 `{f(sig['s2'])}`\n\n"
+
+        f"*🧠 SIGNAL REASONS*\n"
+        f"`{sep}`\n"
+        f"{reasons_block}"
+        f"{opt_note}"
+        f"\n⚠️ _Not financial advice. Trade at your own risk._"
     )
     return msg
 
-# ─── Mini text chart ──────────────────────────────────────────────────────────
-def mini_chart(df: pd.DataFrame, sym: str) -> str:
-    closes = df["Close"].squeeze().tail(20).values
-    mn, mx = closes.min(), closes.max()
-    rows   = 6
-    chart  = []
-    for row in range(rows, -1, -1):
-        line = ""
-        threshold = mn + (row / rows) * (mx - mn)
-        for val in closes:
-            line += "█" if val >= threshold else " "
-        chart.append(line)
-    trend = "📈 UPTREND" if closes[-1] > closes[0] else "📉 DOWNTREND"
-    pct   = ((closes[-1] - closes[0]) / closes[0]) * 100
-    txt   = (
-        f"📊 *{sym} — Last 20 Candles*\n"
-        f"```\n"
-    )
-    for row in chart:
-        txt += row + "\n"
-    txt += (
-        f"```\n"
-        f"High: `{fmt(mx)}`  Low: `{fmt(mn)}`\n"
-        f"Now:  `{fmt(float(closes[-1]))}`\n"
-        f"{trend}  ({pct:+.2f}% over 20 bars)\n"
-    )
-    return txt
-
-# ─── Market status helper ─────────────────────────────────────────────────────
-def market_status() -> str:
+# ── Market hours ──────────────────────────────────────────────────────────────
+def mkt_status() -> str:
     now = datetime.now(IST)
-    weekday = now.weekday()  # 0=Mon 6=Sun
-    t = now.time()
-    nse_open  = dtime(9, 15)
-    nse_close = dtime(15, 30)
-    if weekday >= 5:
-        nse = "🔴 Closed (Weekend)"
-    elif nse_open <= t <= nse_close:
-        nse = "🟢 Open"
-    else:
-        nse = "🔴 Closed"
-    # Crypto is always open
-    crypto = "🟢 Always Open"
-    # US market rough (UTC+5:30 → NYSE 9:30–16:00 ET = 19:00–01:30 IST)
-    us_open  = dtime(19, 0)
-    us_close = dtime(1, 30)
-    if us_open <= t or t <= us_close:
-        us = "🟢 Open"
-    else:
-        us = "🔴 Closed"
-    return (
-        f"🇮🇳 *NSE/BSE:*  {nse}\n"
-        f"₿  *Crypto:*   {crypto}\n"
-        f"🇺🇸 *NYSE/NASDAQ:* {us}\n"
-    )
+    t   = now.time()
+    wd  = now.weekday()
+    nse = "🟢 Open" if wd<5 and dtime(9,15)<=t<=dtime(15,30) else "🔴 Closed"
+    us  = "🟢 Open" if t>=dtime(19,0) or t<=dtime(1,30) else "🔴 Closed"
+    return f"🇮🇳 NSE: {nse} | 🇺🇸 NYSE: {us} | ₿ Crypto: 🟢 24/7"
 
-# ─── Handlers ─────────────────────────────────────────────────────────────────
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 *TradingBot v2 is LIVE!*\n\n"
-        "Type /help to see all commands.",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "📖 *TradingBot Commands*\n\n"
-        "`/signal BTC`\n"
-        "  → Full signal for crypto/stocks/indices\n\n"
-        "`/signal NIFTY`\n"
-        "  → NSE index signal\n\n"
-        "`/signal NIFTY 24000 CE`\n"
-        "  → Options signal (CE or PE)\n\n"
-        "`/chart RELIANCE`\n"
-        "  → Mini price chart + trend\n\n"
-        "`/watchlist`\n"
-        "  → Quick scan of all tracked symbols\n\n"
-        "`/status`\n"
-        "  → Bot health + market hours\n\n"
-        "*Supported: BTC ETH NIFTY BANKNIFTY SENSEX*\n"
-        "*RELIANCE TCS INFY HDFC ICICIBANK SBIN*\n"
-        "*TSLA NVDA AAPL MSFT META GOOGL AMZN*\n\n"
-        "⚠️ _Not financial advice._"
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
+# ── /signal (no args) → auto scan ALL symbols ─────────────────────────────────
 async def cmd_signal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    args = ctx.args
+    args = ctx.args or []
+
+    # ── CASE 1: /signal → scan everything ──
     if not args:
-        await update.message.reply_text(
-            "Usage:\n`/signal BTC`\n`/signal NIFTY`\n`/signal NIFTY 24000 CE`",
+        wait = await update.message.reply_text(
+            "🔍 *Scanning all symbols... please wait (~30s)*",
             parse_mode=ParseMode.MARKDOWN
         )
+        buys, sells, skips = [], [], []
+        for sym in ALL_SYMBOLS:
+            try:
+                df = fetch(resolve(sym))
+                if df is None: continue
+                ind = indicators(df)
+                sig = signal(ind)
+                emoji = "🟢" if sig["raw"]=="BUY" else "🔴"
+                take  = "✅" if sig["take"] else "❌"
+                line  = f"{emoji} *{sym}* `{sig['dir']}` | Conf:`{sig['conf']}%` | Entry:`{f(sig['entry'])}` | SL:`{f(sig['sl'])}` | T1:`{f(sig['t1'])}` {take}"
+                if sig["take"] and sig["raw"]=="BUY":   buys.append(line)
+                elif sig["take"] and sig["raw"]=="SELL": sells.append(line)
+                else: skips.append(f"⚪ *{sym}*: {sig['dir']} | Conf:`{sig['conf']}%` {take}")
+            except Exception:
+                continue
+
+        now = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
+        sep = "━"*30
+        out = f"📡 *AUTO SCAN — {now}*\n`{sep}`\n{mkt_status()}\n`{sep}`\n\n"
+
+        if buys:
+            out += f"🚀 *BUY SIGNALS ({len(buys)})*\n`{sep}`\n" + "\n".join(buys) + "\n\n"
+        if sells:
+            out += f"📉 *SELL SIGNALS ({len(sells)})*\n`{sep}`\n" + "\n".join(sells) + "\n\n"
+        if not buys and not sells:
+            out += "⚪ *No actionable signals right now.*\nMarket is ranging or low confidence.\n\n"
+        if skips:
+            out += f"⚪ *Skipped/Low confidence ({len(skips)})*\n" + "\n".join(skips[:5]) + "\n"
+        out += f"\n💡 _Type `/signal BTC` for a deep dive on any symbol._\n⚠️ _Not financial advice._"
+
+        await wait.edit_text(out, parse_mode=ParseMode.MARKDOWN)
         return
 
-    sym       = args[0].upper()
-    is_options= len(args) == 3
-    strike    = 0.0
-    opt_type  = ""
+    # ── CASE 2: /signal SYM or /signal SYM STRIKE CE/PE ──
+    sym      = args[0].upper()
+    opt_type = ""
+    strike   = 0.0
 
-    if is_options:
+    if len(args) == 3:
         try:
             strike   = float(args[1])
             opt_type = args[2].upper()
             if opt_type not in ("CE", "PE"):
-                await update.message.reply_text("Option type must be CE or PE.")
+                await update.message.reply_text("Option type must be CE or PE.\nExample: `/signal NIFTY 24000 CE`",
+                                                 parse_mode=ParseMode.MARKDOWN)
                 return
         except ValueError:
-            await update.message.reply_text("Invalid strike. Example: `/signal NIFTY 24000 CE`",
+            await update.message.reply_text("Invalid format.\nExample: `/signal NIFTY 24000 CE`",
                                              parse_mode=ParseMode.MARKDOWN)
             return
 
-    ticker = resolve_symbol(sym)
-    wait_msg = await update.message.reply_text(f"⏳ Analysing *{sym}*...",
-                                                parse_mode=ParseMode.MARKDOWN)
+    ticker   = resolve(sym)
+    wait_msg = await update.message.reply_text(
+        f"⏳ Analysing *{sym}{'  '+str(int(strike))+' '+opt_type if opt_type else ''}*...",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
-    df = fetch_data(ticker)
+    df = fetch(ticker)
     if df is None:
         await wait_msg.edit_text(
-            f"❌ Could not fetch data for *{sym}* (`{ticker}`)\n"
-            f"Check symbol or try: BTC, NIFTY, RELIANCE, TSLA",
+            f"❌ No data for *{sym}* (`{ticker}`)\nTry: BTC NIFTY RELIANCE TSLA",
             parse_mode=ParseMode.MARKDOWN
         )
         return
 
-    ind = calc_indicators(df)
-    sig = generate_signal(ind, is_options, opt_type, strike)
-    msg = build_signal_message(sym, ticker, ind, sig, is_options, opt_type, strike)
-
+    ind = indicators(df)
+    sig = signal(ind, opt_type)
+    msg = build_msg(sym, ticker, ind, sig, opt_type, strike)
     await wait_msg.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
-    log.info(f"Signal sent: {sym} → {sig['direction']} @ {sig['entry']} | Conf: {sig['confidence']}%")
+    log.info(f"Signal: {sym} {opt_type} → {sig['dir']} | {sig['conf']}% | Entry {sig['entry']}")
 
+# ── /chart ────────────────────────────────────────────────────────────────────
 async def cmd_chart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args:
         await update.message.reply_text("Usage: `/chart BTC`", parse_mode=ParseMode.MARKDOWN)
         return
-    sym    = ctx.args[0].upper()
-    ticker = resolve_symbol(sym)
-    wait   = await update.message.reply_text(f"⏳ Loading chart for *{sym}*...",
-                                              parse_mode=ParseMode.MARKDOWN)
-    df = fetch_data(ticker)
+    sym  = ctx.args[0].upper()
+    wait = await update.message.reply_text(f"⏳ *{sym}* chart...", parse_mode=ParseMode.MARKDOWN)
+    df   = fetch(resolve(sym))
     if df is None:
-        await wait.edit_text(f"❌ No data for {sym}")
-        return
-    txt = mini_chart(df, sym)
+        await wait.edit_text(f"❌ No data for {sym}"); return
+    closes = df["Close"].squeeze().tail(20).values
+    mn, mx = closes.min(), closes.max()
+    rows   = 6; chart = []
+    for row in range(rows, -1, -1):
+        thresh = mn + (row/rows)*(mx-mn)
+        chart.append("".join("█" if v>=thresh else " " for v in closes))
+    trend = "📈 UPTREND" if closes[-1]>closes[0] else "📉 DOWNTREND"
+    pct   = (closes[-1]-closes[0])/closes[0]*100
+    txt   = f"📊 *{sym} — Last 20 candles*\n```\n" + "\n".join(chart) + f"\n```\n"
+    txt  += f"High `{f(float(mx))}`  Low `{f(float(mn))}`  Now `{f(float(closes[-1]))}`\n"
+    txt  += f"{trend}  ({pct:+.2f}% / 20 bars)"
     await wait.edit_text(txt, parse_mode=ParseMode.MARKDOWN)
 
+# ── /watchlist ────────────────────────────────────────────────────────────────
+WATCHLIST = ["NIFTY","BANKNIFTY","RELIANCE","TCS","BTC","ETH","TSLA","NVDA"]
+
 async def cmd_watchlist(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    wait = await update.message.reply_text("⏳ Scanning watchlist...",
-                                            parse_mode=ParseMode.MARKDOWN)
-    results = []
+    wait = await update.message.reply_text("⏳ Scanning watchlist...", parse_mode=ParseMode.MARKDOWN)
+    rows = []
     for sym in WATCHLIST:
         try:
-            ticker = resolve_symbol(sym)
-            df     = fetch_data(ticker)
-            if df is None:
-                results.append(f"❌ {sym}: No data")
-                continue
-            ind = calc_indicators(df)
-            sig = generate_signal(ind)
-            emoji = "🟢" if "BUY" in sig["direction"] else ("🔴" if "SELL" in sig["direction"] else "⚖️")
-            take  = "✅" if sig["take_trade"] else "❌"
-            results.append(
-                f"{emoji} *{sym}*: {sig['direction']} | "
-                f"Conf: `{sig['confidence']}%` | "
-                f"Entry: `{fmt(sig['entry'])}` | {take}"
-            )
+            df  = fetch(resolve(sym))
+            if df is None: rows.append(f"❌ {sym}"); continue
+            ind = indicators(df)
+            sig = signal(ind)
+            em  = "🟢" if sig["raw"]=="BUY" else "🔴"
+            tk  = "✅" if sig["take"] else "❌"
+            rows.append(f"{em} *{sym}*: `{sig['dir']}` Conf:`{sig['conf']}%` E:`{f(sig['entry'])}` {tk}")
         except Exception:
-            results.append(f"⚠️ {sym}: Error")
-
+            rows.append(f"⚠️ {sym}: error")
     now = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
-    msg = f"📋 *Watchlist Scan — {now}*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-    msg += "\n".join(results)
-    msg += "\n\n⚠️ _Not financial advice._"
+    msg = f"📋 *Watchlist — {now}*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    msg += "\n".join(rows) + "\n\n⚠️ _Not financial advice._"
     await wait.edit_text(msg, parse_mode=ParseMode.MARKDOWN)
 
+# ── /status ───────────────────────────────────────────────────────────────────
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(IST).strftime("%d %b %Y  %H:%M IST")
-    ms  = market_status()
     msg = (
-        f"🤖 *TradingBot v2 — Status*\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 Bot: *Online*\n"
-        f"🕐 Time: `{now}`\n\n"
-        f"*Market Hours:*\n{ms}\n"
-        f"Data Source: Yahoo Finance\n"
-        f"Indicators: RSI, MACD, EMA9/20/50/200,\n"
-        f"  BB, Stoch, ATR, ADX, CCI, OBV\n"
+        f"🤖 *TradingBot v3 — Online*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🕐 `{now}`\n{mkt_status()}\n\n"
+        f"📈 Indicators: RSI · MACD · EMA9/20/50/200\n"
+        f"  Bollinger · Stoch · ATR · ADX · CCI · OBV\n"
+        f"📡 Data: Yahoo Finance (1h + 1d fallback)\n"
+        f"🔢 Symbols tracked: {len(ALL_SYMBOLS)}"
     )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
-async def unknown_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ── /help ─────────────────────────────────────────────────────────────────────
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = (
+        "📖 *TradingBot v3 — Commands*\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "`/signal`\n"
+        "  → 🔍 Auto-scan ALL symbols\n\n"
+        "`/signal BTC`\n"
+        "  → 📊 Deep signal: entry, SL, T1/T2/T3, risk meter\n\n"
+        "`/signal NIFTY 24000 CE`\n"
+        "  → 📋 Options signal for CE\n\n"
+        "`/signal NIFTY 24000 PE`\n"
+        "  → 📋 Options signal for PE\n\n"
+        "`/chart RELIANCE`\n"
+        "  → 📈 ASCII price chart\n\n"
+        "`/watchlist`\n"
+        "  → 📋 Quick scan of 8 key symbols\n\n"
+        "`/status`\n"
+        "  → 🤖 Bot health + market hours\n\n"
+        "*Symbols:* NIFTY BANKNIFTY SENSEX RELIANCE TCS INFY\n"
+        "HDFCBANK ICICIBANK SBIN BTC ETH SOL TSLA NVDA AAPL...\n\n"
+        "⚠️ _Not financial advice._"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Unknown command. Type /help for all commands."
+        "👋 *TradingBot v3 is LIVE!*\n\nType /help or just `/signal` to scan all symbols.",
+        parse_mode=ParseMode.MARKDOWN
     )
 
-# ─── Main ─────────────────────────────────────────────────────────────────────
+async def unknown(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Unknown command. Try /help")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if not TELEGRAM_TOKEN:
-        log.error("TELEGRAM_BOT_TOKEN not set in .env")
-        sys.exit(1)
-
+        log.error("Set TELEGRAM_BOT_TOKEN in .env"); sys.exit(1)
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("help",      cmd_help))
     app.add_handler(CommandHandler("signal",    cmd_signal))
     app.add_handler(CommandHandler("chart",     cmd_chart))
     app.add_handler(CommandHandler("watchlist", cmd_watchlist))
     app.add_handler(CommandHandler("status",    cmd_status))
-    app.add_handler(MessageHandler(filters.COMMAND, unknown_cmd))
-
-    log.info("TradingBot Telegram interface started ✅")
+    app.add_handler(MessageHandler(filters.COMMAND, unknown))
+    log.info("TradingBot v3 started ✅")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
