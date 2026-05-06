@@ -1,70 +1,58 @@
-# TradingBot v2.1
+# TradingBot v3.0
 
-Advanced NSE signal bot: **Gemini AI** + **13 instruments** + **Telegram alerts & commands**.
+Advanced Multi-Market Signal Bot: **NSE + MCX Commodities + Crypto (24/7)** with **Gemini AI Why-This-Trade** explanations.
 
-## Features
-- 11 technical indicators: RSI, MACD, ADX +/-DI, EMA9/21, SMA50/200, ATR, Bollinger Bands, Stochastic, CCI, Volume Ratio
-- Gemini 1.5 Flash AI with 4-squad analysis (Trend, Momentum, Volatility, Volume)
-- Per-symbol cooldown (60 min) — no duplicate spam
-- Daily summary at 3:35 PM IST
-- Market hours aware (NSE 9:15–15:30 IST, Mon–Fri)
-- Interactive Telegram commands (locked to your chat_id only)
-- Auto-restart via systemd
+## Markets Covered
 
-## Symbols Monitored (13)
-**Indices:** NIFTY 50, BANK NIFTY, MIDCAP 50  
-**F&O Stocks:** RELIANCE, TCS, INFOSYS, HDFC BANK, ICICI BANK, WIPRO, ADANIENT, TATAMOTORS, BAJFINANCE, AXISBANK
+| Market | Symbols | Hours |
+|---|---|---|
+| NSE Indices | NIFTY 50, BANK NIFTY, MIDCAP 50 | 09:15–15:30 IST Mon-Fri |
+| NSE F&O Stocks | 15 top stocks (RELIANCE, TCS, INFY...) | 09:15–15:30 IST Mon-Fri |
+| MCX Commodities | GOLD, SILVER, CRUDE OIL, NAT GAS, COPPER, ZINC, ALUMINIUM | 09:00–23:30 IST Mon-Sat |
+| Crypto | BTC, ETH, BNB, SOL, XRP, ADA, DOGE, MATIC | 24/7 Always Open |
+
+**Total: 33 symbols scanned**
+
+## Why-This-Trade Feature
+
+Every signal includes a detailed AI explanation:
+```
+🧠 Why This Trade?
+  • RSI: at 68, approaching overbought but still room to run
+  • MACD: histogram turning positive for 3 candles confirming momentum
+  • EMA: price above EMA9 and EMA21, both sloping up = bullish stack
+  • ADX: at 28 confirms strong trend, +DI > -DI buyers in control
+  • VOLUME: 2.1x above average = institutional accumulation
+```
 
 ## Telegram Commands
+
 | Command | Description |
 |---|---|
 | /start | Show all commands |
-| /status | Uptime, signal count, market status |
+| /status | Uptime, all market counts, open/closed status |
 | /signals | All signals fired today |
-| /symbols | All 13 monitored symbols |
-| /market | Is NSE open right now? |
+| /nse | NSE Indices + F&O Stocks |
+| /stocks | NSE F&O Stocks only |
+| /mcx | MCX Commodities list |
+| /crypto | Crypto symbols list |
+| /market | Live status of all 3 markets |
 | /stop | Stop the bot |
 
-## DigitalOcean Setup (One Command)
+## DigitalOcean Setup
 ```bash
 ssh root@your_droplet_ip
-curl -O https://raw.githubusercontent.com/geethu5166/TradingBot/main/setup_digitalocean.sh
-bash setup_digitalocean.sh
-```
-
-Then add keys:
-```bash
-nano /root/TradingBot/.env
-```
-
-Add:
-```
-GEMINI_API_KEY=your_gemini_key_here
-TELEGRAM_BOT_TOKEN=your_bot_token_here
-TELEGRAM_CHAT_ID=your_chat_id_here
-```
-
-Start:
-```bash
-systemctl start tradingbot
+cd /root/TradingBot
+git pull && systemctl restart tradingbot
 journalctl -u tradingbot -f
 ```
 
-## Useful Commands on Droplet
-```bash
-systemctl status tradingbot     # Check if running
-systemctl restart tradingbot    # Restart after changes
-journalctl -u tradingbot -f     # Live logs
-tail -f /root/TradingBot/bot.log # Bot log file
-git pull && systemctl restart tradingbot  # Update & restart
+## .env Keys
 ```
-
-## .env Keys Reference
-| Key | Where to get it |
-|---|---|
-| GEMINI_API_KEY | https://aistudio.google.com -> Get API Key |
-| TELEGRAM_BOT_TOKEN | Telegram -> @BotFather -> /newbot |
-| TELEGRAM_CHAT_ID | Telegram -> @userinfobot -> start it |
+GEMINI_API_KEY=your_gemini_key
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_CHAT_ID=your_chat_id
+```
 
 ## Disclaimer
 For educational and research purposes only. Not financial advice.
