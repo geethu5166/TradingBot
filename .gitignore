@@ -1,65 +1,66 @@
 ```
-# Python
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Dependencies
+venv/
+.venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-.Python
-env/
-venv/
-.venv/
-.eggs/
-.egg-info/
+
+# Build artifacts
 dist/
 build/
-*.egg-info/
+*.so
+*.dylib
+*.dll
 
 # Logs
 *.log
 
-# OS generated files
+# Temporary files
+*.tmp
+*.swp
+*~
 .DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
 Thumbs.db
 
-# Environment variables
-.env
-.env.local
-.env.*
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
 
-# IDE specific
+# IDE files
 .vscode/
 .idea/
 *.swp
 *.swo
-*.tmp
 
-# Testing
-.coverage
-htmlcov/
-coverage/
-.pytest_cache/
-.mypy_cache/
-
-# Distribution / packaging
-*.tar.gz
-*.whl
+# Compressed files
 *.zip
-
-# Jupyter Notebook
-.ipynb_checkpoints
-
-# MyPy
-.mypy_cache/
-
-# Gradle
-.gradle/
-build/
-
-# Target
-target/
+*.gz
+*.tar
+*.tgz
+*.bz2
+*.xz
+*.7z
+*.rar
+*.zst
+*.lz4
+*.lzh
+*.cab
+*.arj
+*.rpm
+*.deb
+*.Z
+*.lz
+*.lzo
+*.tar.gz
+*.tar.bz2
+*.tar.xz
+*.tar.zst
 ```
