@@ -1,7 +1,0 @@
-google-generativeai
-yfinance
-ta
-python-dotenv
-requests
-pandas
-numpy
